@@ -160,7 +160,7 @@ QLabs.launch     % Launch QLabs from MATLAB
 ```
 ACC-Competition-2026/
 ├── README.md                 # This file
-├── DetailedScenario.md       # Competition scenario and objectives
+├── DetailedScenario.md       # Scenario, core principles, submission requirements
 ├── matlab/                   # MATLAB/Simulink development
 │   ├── models/              # Simulink models
 │   ├── scripts/             # MATLAB scripts
@@ -170,11 +170,9 @@ ACC-Competition-2026/
 │   └── Development_Guide.md
 ├── Handbook/                 # Competition rules
 │   └── README.md
-├── docs/                     # Documentation
-│   ├── architecture.md
-│   └── progress/
-└── scripts/                  # Utility scripts
-    └── setup.sh
+└── docs/                     # Documentation
+    ├── architecture.md
+    └── progress/
 ```
 
 ---

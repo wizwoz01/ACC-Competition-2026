@@ -23,7 +23,7 @@ Using **MATLAB/Simulink** for this competition because:
 ## Quick Links
 
 - [Main README](../README.md) - Project overview and setup
-- [Detailed Scenario](../DetailedScenario.md) - Competition objectives
+- [Detailed Scenario](../DetailedScenario.md) - Scenario, core principles, submission requirements
 - [Development Guide](../Software/Development_Guide.md) - MATLAB workflow
 
 ---

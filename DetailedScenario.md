@@ -28,9 +28,60 @@ Teams will operate an **autonomous taxi service** in Quanser City. The goal is t
 
 ---
 
+## 🧠 Core Principles of Self-Driving
+
+Based on the [Virtual Stage Competition Guide](https://quanser.github.io/student-competitions/events/common/Rules_and_Objectives/Virtual_Stage_Competition_Guide.html#core-principles-of-self-driving), the algorithm must demonstrate these four core principles:
+
+### 1. Data Collection
+A self-driving algorithm must collect and filter information from interoceptive and exteroceptive sensors. Demonstrating the conversion of raw data to meaningful information is critical for making higher-level decisions during an autonomous task.
+
+**Implementation:**
+- [ ] Camera image processing
+- [ ] LIDAR point cloud filtering
+- [ ] Sensor fusion techniques
+- [ ] Data preprocessing pipelines
+
+### 2. Interpretation
+Using system-relevant data, the car must correlate gathered information to factors happening internally or externally in the environment.
+
+**External Factors:**
+- [ ] Traffic sign identification
+- [ ] Traffic light recognition
+- [ ] Pedestrian detection
+- [ ] Other vehicle detection
+
+**Internal Factors:**
+- [ ] System state identification
+- [ ] Error monitoring
+- [ ] Performance tracking
+
+### 3. Control Systems
+From the set of viable options determined in interpretation, the car must execute accurately on the chosen option.
+
+**Requirements:**
+- [ ] Staying within lanes
+- [ ] Executing turns
+- [ ] Stopping at traffic controls
+- [ ] Altering path based on obstacles
+- [ ] Maintaining desired speed
+
+### 4. Localization and Path Planning
+The car must understand where it is within the roadmap and determine how to get to another location.
+
+**Requirements:**
+- [ ] Global/local map storage
+- [ ] Position determination in space
+- [ ] Route planning to destinations
+- [ ] Dynamic route adjustment based on:
+  - Vehicles on the road
+  - Road obstructions
+  - Pedestrians entering/leaving roadway
+
+---
+
 ## 🚦 Traffic Scenarios
 
-Your autonomous vehicle must handle the following traffic scenarios:
+The autonomous vehicle must handle the following traffic scenarios:
 
 ### Basic Navigation
 - [ ] Lane following
@@ -54,37 +105,52 @@ Your autonomous vehicle must handle the following traffic scenarios:
 - [ ] Merging and lane changes
 - [ ] Roundabout navigation
 - [ ] Parking at pick-up/drop-off locations
-- [ ] Weather conditions 
 
 ---
 
-## 📊 Scoring System
+## 📊 Ranking Criteria
 
-### Rating Factors
+Teams will be ranked using the following criteria (from [Virtual Stage Competition Guide](https://quanser.github.io/student-competitions/events/common/Rules_and_Objectives/Virtual_Stage_Competition_Guide.html)):
 
-| Factor | Impact | Description |
-|--------|--------|-------------|
-| **Ride Completion** | High | Successfully completing the ride |
-| **Safety** | High | No collisions, safe driving behavior |
-| **Rule Compliance** | Medium | Following traffic rules |
-| **Efficiency** | Medium | Time to complete ride |
-| **Comfort** | Low | Smooth driving, minimal jerks |
+| Priority | Criteria | Description |
+|----------|----------|-------------|
+| 1 | **Algorithm Readiness** | Based on the four core principles of self-driving |
+| 2 | **Driving Accuracy** | Staying within the lanes |
+| 3 | **Traffic Compliance** | Timely reaction to road signage and traffic controls |
+| 4 | **Communication** | Clear and concise explanation of self-driving concepts |
 
-### Penalties
+> ⚠️ **Important:** Clear communication is one of the most important criteria because it shows the judges how well the team understands the principles of self-driving.
 
-| Violation | Penalty |
-|-----------|---------|
-| Collision | Major deduction |
-| Running red light | Significant deduction |
-| Running stop sign | Significant deduction |
-| Speeding | Moderate deduction |
-| Leaving lane | Minor deduction |
-| Excessive braking | Minor deduction |
+---
 
-### Earnings Formula
-```
-Ride Earnings = Base Fare × Rating Multiplier - Penalties
-```
+## 📹 Virtual Stage Submission Requirements
+
+Based on the [Virtual Stage Competition Guide](https://quanser.github.io/student-competitions/events/common/Rules_and_Objectives/Virtual_Stage_Competition_Guide.html):
+
+### Submission Checklist
+- [ ] **Video:** Maximum **3-minute** demonstration of self-driving capabilities
+- [ ] **Software:** GitHub link to repository with submission code
+- [ ] **Video Link:** YouTube link demonstrating the code
+
+### ⚠️ Critical Rule
+> **Controlling the QCar or gathering data via the `qvl` library functions will invalidate any submission.**
+
+The QCar must be controlled through proper autonomous algorithms, not manual control or scripted paths using qvl.
+
+### Video Content Requirements
+1. Self-driving capabilities demonstration
+2. Explanation of approach and algorithms
+3. Show the four core principles in action
+
+---
+
+## 🗺️ Coordinate System
+
+The coordinate system is consistent for both virtual and physical stages. QLabs contains 1:1 representations of the Quanser Roadmaps.
+
+- **Origin:** `[0, 0, 0]` defined by the coordinate tool in QLabs
+- **Base Frame:** All coordinates determined from the origin
+- **CityScape Maps:** Full-scale versions of Physical Quanser Roadmaps
 
 ---
 
@@ -103,38 +169,6 @@ Ride Earnings = Base Fare × Rating Multiplier - Penalties
 - **IMU:** Inertial measurement for vehicle state
 - **Encoders:** Wheel speed and position feedback
 - **GPS:** Position estimation (simulated)
-
----
-
-## 📋 Virtual Stage Requirements
-
-### Video Submission Criteria
-
-Your video should demonstrate:
-
-1. **Technical Capability**
-   - Vehicle spawning and initialization
-   - Basic navigation (lane following, turns)
-   - Traffic rule compliance
-   - Obstacle handling
-
-2. **Algorithm Readiness**
-   - Perception pipeline
-   - Planning and decision making
-   - Control implementation
-   - Integration and testing
-
-3. **Documentation**
-   - Clear explanation of approach
-   - Architecture overview
-   - Team presentation
-
-### Recommended Video Structure
-1. Introduction 
-2. System architecture overview
-3. Live demonstration in QLabs
-4. Handling of specific scenarios
-5. Conclusion and next steps
 
 ---
 
@@ -161,11 +195,11 @@ Your video should demonstrate:
 
 ---
 
-## 📚 Reference Materials
+## 📚 References
 
+- [Virtual Stage Competition Guide](https://quanser.github.io/student-competitions/events/common/Rules_and_Objectives/Virtual_Stage_Competition_Guide.html)
 - [ROS Technical Resources](https://github.com/quanser/student-competition-resources-ros)
 - [QLabs Documentation](https://docs.quanser.com/qlabs/)
-- [ACC 2025 Reference](https://github.com/quanser/ACC-Competition-2025)
 - [Competition Page](https://quanser.github.io/student-competitions/events/acc-2026/index.html)
 
 ---
@@ -196,4 +230,3 @@ Your video should demonstrate:
 
 *Last Updated: January 2026*  
 *Beach Autonomous Systems - CSULB*
-
