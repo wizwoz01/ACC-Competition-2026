@@ -125,9 +125,6 @@ Using **MATLAB/Simulink** for this competition. Here's why:
 - 🐍 [Quanser Python API](https://docs.quanser.com/python/)
 - ⚙️ [Quanser C API](https://docs.quanser.com/c/)
 
-### Reference Implementation (2025)
-- 📂 [ACC 2025 Competition Repo](https://github.com/quanser/ACC-Competition-2025)
-
 ---
 
 ## 🚀 Environment Setup
@@ -173,11 +170,6 @@ ACC-Competition-2026/
 │   └── Development_Guide.md
 ├── Handbook/                 # Competition rules
 │   └── README.md
-├── src/                      # Source packages (if switching to ROS 2)
-│   ├── perception/
-│   ├── planning/
-│   ├── control/
-│   └── localization/
 ├── docs/                     # Documentation
 │   ├── architecture.md
 │   └── progress/
