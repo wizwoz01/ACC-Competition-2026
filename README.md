@@ -15,7 +15,7 @@
 
 ## 🏆 Competition Overview
 
-In this year's competition, teams will create a self-driving algorithm capable of navigating through **Quanser City** as an autonomous taxi service. The objective is to **maximize profits** within a certain time period by:
+This competition involves creating a self-driving algorithm capable of navigating through **Quanser City** as an autonomous taxi service. The objective is to **maximize profits** within a certain time period by:
 
 - Navigating to selected pick-up and drop-off coordinates
 - Handling various traffic scenarios while adhering to rules of the road
@@ -70,25 +70,43 @@ In this year's competition, teams will create a self-driving algorithm capable o
 
 ## 💻 Software Stack
 
-This competition uses **ROS 2 Humble** as the primary development framework.
+Using **MATLAB/Simulink** for this competition. Here's why:
 
-### Requirements
-- **OS:** Ubuntu 24.04 (recommended)
-- **GPU:** NVIDIA graphics card
-- **Framework:** ROS 2 Humble via Docker container
-- **Simulation:** Quanser Interactive Labs 
+### 🔀 Development Pathways Comparison
 
-### Development Environment
+| | **MATLAB/Simulink** ✅ | **ROS 2 Humble** |
+|---|---------------------|------------------|
+| **Best For** | Control systems, rapid prototyping | Robotics, multi-sensor fusion |
+| **OS** | Windows 10/11 (native) | Ubuntu 24.04 / WSL2 |
+| **GPU Required** | ❌ No | ✅ Yes (NVIDIA) |
+| **Setup Complexity** | ⭐ Simple | ⭐⭐⭐ Complex |
+| **Docker Required** | ❌ No | ✅ Yes |
+
+---
+
+### 🟦 MATLAB Setup
+
+#### Requirements
+- **OS:** Windows 10/11 (native) - Using a ThinkPad L13
+- **Software:** MATLAB R2023a+ with Simulink
+- **Add-on:** Quanser Interactive Labs for MATLAB
+- **Simulation:** Quanser Interactive Labs (QLabs)
+
+#### Development Structure
 ```
-├── Docker/              # Docker setup and configuration
-├── Software/            # Development guides and utilities
-├── Handbook/            # Competition rules and references
-├── src/                 # ROS 2 packages (your code goes here!)
-│   ├── perception/      # Camera, LIDAR processing
-│   ├── planning/        # Path planning, decision making
-│   ├── control/         # Vehicle control algorithms
-│   └── localization/    # Mapping and localization
-└── docs/                # Team documentation
+├── matlab/                    # MATLAB/Simulink files
+│   ├── models/               # Simulink models
+│   │   ├── vehicle_control.slx
+│   │   ├── path_planning.slx
+│   │   └── perception.slx
+│   ├── scripts/              # MATLAB scripts
+│   │   ├── main.m
+│   │   ├── setup_qcar.m
+│   │   └── utils/
+│   └── config/               # Configuration files
+├── Software/                 # Development guides
+├── Handbook/                 # Competition rules
+└── docs/                     # Documentation
 ```
 
 ---
@@ -112,29 +130,31 @@ This competition uses **ROS 2 Humble** as the primary development framework.
 
 ---
 
-## 🚀 Getting Started
+## 🚀 Environment Setup
 
-### 1. Clone the ROS Technical Resources
-```bash
-git clone https://github.com/quanser/student-competition-resources-ros.git
+### 1. Install QLabs
+- Download from [Quanser Interactive Labs](https://www.quanser.com/digital/quanser-interactive-labs/)
+- Register at [Quanser Academic Portal](https://portal.quanser.com/Accounts/Register)
+- Make sure to register for the competition to get QLabs access
+
+### 2. Install MATLAB Add-on
+```matlab
+% In MATLAB Command Window:
+% Go to Add-Ons → Get Add-Ons → Search "Quanser Interactive Labs for MATLAB"
+% Click "Add" to install
 ```
 
-### 2. Set Up Docker Environment
-```bash
-cd Docker
-# Follow setup instructions in Docker/README.md
-```
-
-### 3. Launch QLabs Simulation
-```bash
-# After Docker setup, launch the simulation environment
-# See Software/Development_Guide.md for details
+### 3. Set Up QLabs Connection
+```matlab
+QLabs.setup      % First-time setup
+QLabs.launch     % Launch QLabs from MATLAB
 ```
 
 ### 4. Start Developing!
-- Check out `src/` for our ROS 2 packages
-- Review `DetailedScenario.md` for competition objectives
-- Consult `Handbook/` for competition rules
+- Create Simulink models for vehicle control
+- Use MATLAB scripts for path planning algorithms
+- Test everything in the QLabs simulation environment
+- See `Software/Development_Guide.md` for full workflow
 
 ---
 
@@ -144,22 +164,21 @@ cd Docker
 ACC-Competition-2026/
 ├── README.md                 # This file
 ├── DetailedScenario.md       # Competition scenario and objectives
-├── Docker/                   # Docker configuration
-│   ├── README.md
-│   ├── Dockerfile
-│   └── docker-compose.yml
+├── matlab/                   # MATLAB/Simulink development
+│   ├── models/              # Simulink models
+│   ├── scripts/             # MATLAB scripts
+│   └── functions/           # Reusable functions
 ├── Software/                 # Development guides
 │   ├── README.md
-│   ├── Development_Guide.md
-│   └── ROS2_Setup.md
+│   └── Development_Guide.md
 ├── Handbook/                 # Competition rules
 │   └── README.md
-├── src/                      # ROS 2 source packages
+├── src/                      # Source packages (if switching to ROS 2)
 │   ├── perception/
 │   ├── planning/
 │   ├── control/
 │   └── localization/
-├── docs/                     # Team documentation
+├── docs/                     # Documentation
 │   ├── architecture.md
 │   └── progress/
 └── scripts/                  # Utility scripts
@@ -172,7 +191,7 @@ ACC-Competition-2026/
 
 - **Technical Questions:** Post on [ROS Technical Resources Issues](https://github.com/quanser/student-competition-resources-ros/issues)
 - **Competition Inquiries:** Email studentcompetition@quanser.com
-- **Team Discussions:** Check the [Discussions Tab](https://github.com/quanser/student-competition-resources-ros/discussions)
+- **Discussions:** Check the [Discussions Tab](https://github.com/quanser/student-competition-resources-ros/discussions)
 
 ---
 
@@ -181,7 +200,7 @@ ACC-Competition-2026/
 | Date | Milestone | Status |
 |------|-----------|--------|
 | Jan 2026 | Project Setup | 🟢 In Progress |
-| Jan 2026 | Environment Configuration | ⏳ Pending |
+| Jan 2026 | Environment Configuration | 🟢 In Progress |
 | Feb 2026 | Basic Navigation | ⏳ Pending |
 | Feb 2026 | Traffic Handling | ⏳ Pending |
 | Feb 2026 | Video Submission | ⏳ Pending |
@@ -195,4 +214,3 @@ ACC-Competition-2026/
 *Beach Autonomous Systems - CSULB CECS*
 
 </div>
-

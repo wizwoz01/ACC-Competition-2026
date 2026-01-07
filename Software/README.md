@@ -5,96 +5,120 @@ This directory contains development guides and utilities for the ACC 2026 Self-D
 ## Contents
 
 - [Development Guide](Development_Guide.md) - Main development workflow
-- [ROS2 Setup](ROS2_Setup.md) - ROS 2 Humble configuration
 - [QLabs Guide](QLabs_Guide.md) - Quanser Interactive Labs usage
 
-## Development Stack
+---
+
+## 🟦 MATLAB/Simulink Stack
+
+Using MATLAB because it doesn't require an NVIDIA GPU and runs natively on Windows.
 
 | Component | Technology |
 |-----------|------------|
-| OS | Ubuntu 24.04 |
-| Middleware | ROS 2 Humble |
+| OS | Windows 10/11 (native) |
+| Development | MATLAB R2023a+ / Simulink |
 | Simulation | Quanser Interactive Labs (QLabs) |
-| Language | Python 3.10+ |
-| Container | Docker |
+| Add-on | Quanser Interactive Labs for MATLAB |
+| Language | MATLAB / Simulink blocks |
+
+---
 
 ## Quick Reference
 
-### ROS 2 Commands
-```bash
-# Source ROS 2
-source /opt/ros/humble/setup.bash
+### MATLAB Commands
 
-# Build workspace
-colcon build
+```matlab
+% First-time setup
+QLabs.setup
 
-# Source workspace
-source install/setup.bash
+% Launch QLabs from MATLAB
+QLabs.launch
 
-# Run a node
-ros2 run <package_name> <node_name>
+% Spawn QCar 2 in simulation
+qcar = QCar2();                    % Create QCar object
+qcar.spawn([0, 0, 0], 0);          % Spawn at position with heading
 
-# Launch a system
-ros2 launch <package_name> <launch_file>
+% Read sensors
+[rgb, depth] = qcar.read_cameras();
+lidar_data = qcar.read_lidar();
+
+% Control vehicle
+qcar.write_velocity(speed, steering_angle);
+
+% Stop and cleanup
+qcar.terminate();
 ```
 
-### QLabs Commands
-```bash
-# Launch QLabs (from container)
-# Specific commands depend on setup - see ROS Technical Resources
-```
+---
 
-## Recommended Development Workflow
+## Development Workflow
 
-1. **Setup Environment**
-   - Start Docker container
-   - Source ROS 2 and workspace
+### 🟦 MATLAB Workflow
+
+1. **Start Environment**
+   - Launch MATLAB
+   - Run `QLabs.launch` to start simulation
 
 2. **Develop**
-   - Write code in `src/` packages
-   - Use VS Code with Remote Containers extension
+   - Create Simulink models for control systems
+   - Write MATLAB scripts for algorithms
+   - Use MATLAB's debugging tools
 
 3. **Build & Test**
-   - Build with `colcon build`
-   - Test in QLabs simulation
+   - Run simulations in QLabs
+   - Use Simulink's simulation mode
+   - Tune parameters in real-time
 
 4. **Iterate**
-   - Debug using ROS 2 tools
-   - Refine algorithms
+   - Analyze data with MATLAB plots
+   - Refine control gains
+   - Optimize algorithms
 
-## ROS 2 Package Structure
+---
+
+## Project Structure
+
+### 🟦 MATLAB Structure
 
 ```
-src/
-├── perception/           # Sensor processing
-│   ├── camera_node.py
-│   ├── lidar_node.py
-│   └── detection_node.py
-├── planning/             # Decision making
-│   ├── path_planner.py
-│   └── behavior_tree.py
-├── control/              # Vehicle control
-│   ├── controller.py
-│   └── pid_controller.py
-└── localization/         # Position estimation
-    ├── odometry.py
-    └── mapping.py
+matlab/
+├── models/               # Simulink models
+│   ├── main_controller.slx
+│   ├── path_planner.slx
+│   └── perception_pipeline.slx
+├── scripts/              # MATLAB scripts
+│   ├── main.m
+│   ├── setup_qcar.m
+│   ├── lane_detection.m
+│   └── path_planning.m
+├── functions/            # Reusable functions
+│   ├── pid_controller.m
+│   ├── pure_pursuit.m
+│   └── image_processing.m
+└── config/               # Parameters
+    └── vehicle_params.m
 ```
 
-## Useful Tools
+---
 
-- **RViz2** - Visualization
-- **rqt** - GUI tools
-- **rosbag2** - Data recording
-- **Plotjuggler** - Data plotting
+## Tools
+
+### 🟦 MATLAB Tools
+- **Simulink** - Model-based design
+- **Stateflow** - State machines for decision logic
+- **Computer Vision Toolbox** - Image processing
+- **Control System Toolbox** - Controller design
+- **MATLAB Plots** - Data visualization
+
+---
 
 ## Resources
 
-- [ROS 2 Humble Docs](https://docs.ros.org/en/humble/)
-- [ROS Technical Resources](https://github.com/quanser/student-competition-resources-ros)
-- [QLabs Documentation](https://docs.quanser.com/qlabs/)
+### MATLAB Resources
+- [Quanser Interactive Labs for MATLAB](https://www.mathworks.com/matlabcentral/fileexchange/123860-quanser-interactive-labs-for-matlab)
+- [QLabs MATLAB Documentation](https://qlabs.quanserdocs.com/)
+- [Simulink Getting Started](https://www.mathworks.com/help/simulink/getting-started-with-simulink.html)
 
 ---
 
 *Beach Autonomous Systems - CSULB*
-
