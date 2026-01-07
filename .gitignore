@@ -1,0 +1,74 @@
+# ROS 2 Build Artifacts
+build/
+install/
+log/
+.colcon/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/
+
+# Logs
+*.log
+logs/
+
+# ROS bags
+*.bag
+*.db3
+rosbag2_*/
+
+# Compiled files
+*.o
+*.a
+*.dSYM/
+
+# Documentation builds
+docs/_build/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Competition specific
+# Uncomment if you want to ignore large media files
+# *.mp4
+# *.avi
+# *.mov
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Data files (uncomment if large)
+# data/
+# *.csv
+# *.pkl
+
