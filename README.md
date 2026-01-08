@@ -129,10 +129,11 @@ Using **MATLAB/Simulink** for this competition. Here's why:
 
 ## 🚀 Environment Setup
 
-### 1. Install QLabs
-- Download from [Quanser Interactive Labs](https://www.quanser.com/digital/quanser-interactive-labs/)
+### 1. Install Required Software
+- **MATLAB R2021a+** with Simulink
+- **QUARC** from [Quanser](https://www.quanser.com/products/quarc/) (real-time control software)
+- **QLabs** from [Quanser Interactive Labs](https://www.quanser.com/digital/quanser-interactive-labs/)
 - Register at [Quanser Academic Portal](https://portal.quanser.com/Accounts/Register)
-- Make sure to register for the competition to get QLabs access
 
 ### 2. Install MATLAB Add-on
 ```matlab
@@ -141,17 +142,22 @@ Using **MATLAB/Simulink** for this competition. Here's why:
 % Click "Add" to install
 ```
 
-### 3. Set Up QLabs Connection
+### 3. Launch QLabs and Connect
 ```matlab
-QLabs.setup      % First-time setup
 QLabs.launch     % Launch QLabs from MATLAB
+% Then select Cityscape workspace in QLabs GUI
 ```
 
-### 4. Start Developing!
-- Create Simulink models for vehicle control
-- Use MATLAB scripts for path planning algorithms
-- Test everything in the QLabs simulation environment
-- See `Software/Development_Guide.md` for full workflow
+### 4. Configure Simulink Model
+In your Simulink model, add **HIL Initialize** block:
+- **Board type:** `qcar2`
+- **Board identifier:** `0@tcpip://localhost:18960`
+
+### 5. Start Developing!
+- Run `matlab/scripts/setup_qcar.m` to set up environment
+- Create Simulink models with QUARC HIL blocks for vehicle control
+- Test your autonomous algorithms in the QLabs simulation
+- See `matlab/README.md` for detailed QUARC configuration
 
 ---
 
