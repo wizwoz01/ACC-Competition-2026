@@ -142,18 +142,27 @@ Using **MATLAB/Simulink** for this competition. Here's why:
 % Click "Add" to install
 ```
 
-### 3. Launch QLabs and Connect
+### 3. Launch QLabs
 ```matlab
 QLabs.launch     % Launch QLabs from MATLAB
 % Then select Cityscape workspace in QLabs GUI
 ```
 
-### 4. Configure Simulink Model
+### 4. Spawn the QCar 2
+Open World workspaces do NOT auto-spawn the QCar. Run the Python spawn script:
+```bash
+cd python
+pip install -r requirements.txt
+python spawn_qcar.py
+```
+Keep this script running while using Simulink.
+
+### 6. Configure Simulink Model
 In your Simulink model, add **HIL Initialize** block:
 - **Board type:** `qcar2`
 - **Board identifier:** `0@tcpip://localhost:18960`
 
-### 5. Start Developing!
+### 7. Start Developing!
 - Run `matlab/scripts/setup_qcar.m` to set up environment
 - Create Simulink models with QUARC HIL blocks for vehicle control
 - Test your autonomous algorithms in the QLabs simulation
@@ -171,6 +180,9 @@ ACC-Competition-2026/
 │   ├── models/              # Simulink models
 │   ├── scripts/             # MATLAB scripts
 │   └── functions/           # Reusable functions
+├── python/                   # Python scripts (spawning only)
+│   ├── spawn_qcar.py        # Spawn QCar for QUARC control
+│   └── requirements.txt     # Python dependencies
 ├── Software/                 # Development guides
 │   ├── README.md
 │   └── Development_Guide.md

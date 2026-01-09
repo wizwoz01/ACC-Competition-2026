@@ -23,22 +23,81 @@ QLabs.launch
 
 ### 2. Select Workspace in QLabs GUI
 - Choose **Cityscape** or **Open Road** workspace
-- Wait for the environment to load fully
+- Wait for the environment to load fully (buildings/road appear)
 
-### 3. Open Your Simulink Model
+### 3. ⚠️ Spawn the QCar 2 (CRITICAL STEP!)
+
+**Open World workspaces do NOT auto-spawn the QCar!** You must run the Python spawn script:
+
+```bash
+cd python
+python spawn_qcar.py
+```
+
+Keep this script running while using Simulink. The QCar will appear in QLabs.
+
+> **Competition Note:** Using `qvl` for spawning is allowed. The rule forbids using `qvl` for *controlling* or *gathering data*, not for environment setup.
+
+### 4. Verify Connection (Optional)
+```matlab
+run('matlab/scripts/test_qlabs_connection.m')
+```
+All ports should show [OK] now that the QCar is spawned.
+
+### 5. Open Your Simulink Model
 Your Simulink model should contain:
 - **HIL Initialize** block with:
   - Board type: `qcar2`
   - Board identifier: `0@tcpip://localhost:18960`
 
-### 4. Run the Simulink Model
+### 6. Run the Simulink Model
 - Click **Run** in Simulink
 - The virtual QCar 2 will respond to your control commands
 - Monitor in QLabs window
 
-### 5. Stop When Done
+### 7. Stop When Done
 - Stop the Simulink model
+- Press Ctrl+C in Python spawn script
 - Close QLabs
+
+---
+
+## 🚕 Taxi Scenario (Virtual Detailed Scenario)
+
+Implements the official sequence:
+
+- Start at Taxi Hub, LED **Red**
+- Navigate to pickup `[0.125, 4.395]`, LED **Green**
+- Full stop, LED **Blue** (pickup)
+- Navigate to dropoff `[-0.905, 0.800]`, LED **Green**
+- Full stop, LED **Orange** (dropoff)
+- Return to Taxi Hub, LED **Red** (await)
+
+### Run (recommended)
+
+1. In a terminal, run the environment setup/spawn script:
+  - `python/Setup_Real_Scenario.py`
+2. In MATLAB:
+  - Run `matlab/scripts/run_taxi_scenario.m`
+
+This generates an algorithm-only model at:
+
+- `matlab/models/taxi_stack.slx`
+
+That model outputs:
+
+- `v_cmd_mps` (speed command)
+- `delta_cmd_rad` (steering command)
+- `led_rgb` (`uint8(3x1)` RGB)
+- `state` (mission state id)
+
+Wire its inputs/outputs into your QUARC I/O model (GPS/IMU in, motor/steering/LED out).
+
+### Parameters
+
+The scenario coordinates and thresholds are in:
+
+- `matlab/config/taxi_scenario_params.m`
 
 ---
 

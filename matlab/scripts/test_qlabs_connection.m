@@ -112,7 +112,15 @@ else
     fprintf('Troubleshooting:\n');
     fprintf('1. Make sure QLabs is running\n');
     fprintf('2. Make sure you selected Cityscape or Open Road workspace\n');
-    fprintf('3. Wait for the workspace to fully load (see QCar in view)\n');
+    fprintf('3. Wait for the workspace to fully load (buildings visible)\n');
+    fprintf('\n');
+    fprintf('*** MOST LIKELY CAUSE: QCar 2 is NOT spawned! ***\n');
+    fprintf('Open World workspaces (Cityscape, Open Road) do NOT auto-spawn the QCar.\n');
+    fprintf('Run the Python spawn script first:\n');
+    fprintf('   > cd python\n');
+    fprintf('   > python spawn_qcar.py\n');
+    fprintf('Keep it running, then re-run this test.\n');
+    fprintf('\n');
     fprintf('4. Check that no other application is using these ports\n');
     fprintf('5. Try restarting QLabs\n');
 end

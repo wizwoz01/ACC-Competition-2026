@@ -90,11 +90,17 @@ if qlabsOK
             fprintf('1. Log in to QLabs with your Quanser credentials\n');
             fprintf('2. Select workspace: Cityscape or Open Road\n');
             fprintf('3. Wait for the environment to fully load\n');
-            fprintf('4. You should see the QCar 2 in the scene\n');
             fprintf('\n');
-            fprintf('Then run one of these:\n');
-            fprintf('  - test_qlabs_connection  (to verify connection)\n');
-            fprintf('  - Open your Simulink model and click Run\n');
+            fprintf('*** IMPORTANT: Open World workspaces do NOT auto-spawn QCar ***\n');
+            fprintf('4. Run the Python spawn script to create the QCar 2:\n');
+            fprintf('   > cd python\n');
+            fprintf('   > python spawn_qcar.py\n');
+            fprintf('   (Keep the Python script running while using Simulink)\n');
+            fprintf('\n');
+            fprintf('5. After QCar is spawned, test connection:\n');
+            fprintf('   >> run test_qlabs_connection\n');
+            fprintf('\n');
+            fprintf('6. Then run your Simulink model to control the vehicle.\n');
             fprintf('\n');
         catch ME
             fprintf('[ERROR] Failed to launch QLabs: %s\n', ME.message);
