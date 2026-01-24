@@ -29,7 +29,7 @@ All **vehicle control** and **sensor data gathering** is done via **QUARC/Simuli
 
 | Script | Description |
 |--------|-------------|
-| `spawn_qcar.py` | Spawns QCar 2 at default position for QUARC control |
+| `Setup_Real_Scenario_fullscale_x10.py` | Spawns QCar 2 at default position for QUARC control |
 
 ---
 
@@ -42,7 +42,7 @@ pip install -r requirements.txt
 
 ### Run Spawn Script
 ```bash
-python spawn_qcar.py
+python Setup_Real_Scenario_fullscale_x10.py
 ```
 
 **Keep this script running** while using your Simulink model.
@@ -55,7 +55,7 @@ Press `Ctrl+C` when done to close connection and despawn the QCar.
 
 1. **Launch QLabs** (from MATLAB or manually)
 2. **Select workspace** (Cityscape or Open Road)
-3. **Run `spawn_qcar.py`** - QCar appears in QLabs
+3. **Run `Setup_Real_Scenario_fullscale_x10.py`** - QCar appears in QLabs
 4. **Run Simulink model** - Controls the spawned QCar via QUARC
 5. **Stop Simulink** when done
 6. **Ctrl+C** the Python script
