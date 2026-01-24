@@ -36,9 +36,8 @@ All **vehicle control** and **sensor data gathering** is done via **QUARC/Simuli
 ## 🚀 Usage
 
 ### Install Requirements
-```bash
-pip install -r requirements.txt
-```
+
+
 
 ### Run Spawn Script
 ```bash
