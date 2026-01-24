@@ -27,7 +27,6 @@ This competition involves creating a self-driving algorithm capable of navigatin
 | Role | Name | Email |
 |------|------|-------|
 | **Team Captain** | TBD | TBD |
-
 | **Team Member** | Ricardo Cervantes | ricardo.cervantes01@student.csulb.edu |
 | **Team Member** | Michelle Do | Michelle.Do01@student.csulb.edu |
 | **Team Member** | Gricel Aguilar Quiroz | Gricel.AguilarQuiroz01@student.csulb.edu |
