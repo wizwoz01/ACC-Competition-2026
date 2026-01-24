@@ -26,7 +26,15 @@ This competition involves creating a self-driving algorithm capable of navigatin
 
 | Role | Name | Email |
 |------|------|-------|
-| **Team Captain** | Ricardo Cervantes | ricardo.cervantes01@student.csulb.edu |
+| **Team Captain** | TBD | TBD |
+
+| **Team Member** | Ricardo Cervantes | ricardo.cervantes01@student.csulb.edu |
+| **Team Member** | Michelle Do | Michelle.Do01@student.csulb.edu |
+| **Team Member** | Gricel Aguilar Quiroz | Gricel.AguilarQuiroz01@student.csulb.edu |
+| **Team Member** | Delsin Carbonell | Delsin.Carbonell01@student.csulb.edu |
+| **Team Member** | Matthew Margulies | Matthew.Margulies01@student.csulb.edu |
+| **Team Member** | Ishank Sharma | Ishank.Sharma01@student.csulb.edu |
+| **Team Member** | Kiki Han | Kiki.Han01@student.csulb.edu |
 | **Faculty Supervisor** | Dr. Xin Qin | xin.qin@csulb.edu |
 
 **Institution:** California State University Long Beach  
