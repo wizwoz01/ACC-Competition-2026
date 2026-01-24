@@ -31,7 +31,7 @@ QLabs.launch
 
 ```bash
 cd python
-python spawn_qcar.py
+python Setup_Real_Scenario_fullscale_x10.py
 ```
 
 Keep this script running while using Simulink. The QCar will appear in QLabs.
@@ -66,17 +66,19 @@ Your Simulink model should contain:
 
 Implements the official sequence:
 
-- Start at Taxi Hub, LED **Red**
+- Start at Taxi Hub, LED **Magenta**
 - Navigate to pickup `[0.125, 4.395]`, LED **Green**
 - Full stop, LED **Blue** (pickup)
 - Navigate to dropoff `[-0.905, 0.800]`, LED **Green**
 - Full stop, LED **Orange** (dropoff)
-- Return to Taxi Hub, LED **Red** (await)
+- Return to Taxi Hub, LED **Magenta** (await)
 
 ### Run (recommended)
 
 1. In a terminal, run the environment setup/spawn script:
   - `python/Setup_Real_Scenario.py`
+    or
+  - `python/Setup_Real_Scenario_fullscale_x10.py`
 2. In MATLAB:
   - Run `matlab/scripts/run_taxi_scenario.m`
 
@@ -86,10 +88,6 @@ This generates an algorithm-only model at:
 
 That model outputs:
 
-- `v_cmd_mps` (speed command)
-- `delta_cmd_rad` (steering command)
-- `led_rgb` (`uint8(3x1)` RGB)
-- `state` (mission state id)
 
 Wire its inputs/outputs into your QUARC I/O model (GPS/IMU in, motor/steering/LED out).
 
@@ -110,7 +108,6 @@ The scenario coordinates and thresholds are in:
 
 ### `scripts/` - MATLAB Scripts
 - `main.m` - Main entry point
-- `qlabs_qcar2_setup.m` - QLabs connection documentation
 - `test_*.m` - Test scripts
 
 ### `functions/` - Reusable Functions
@@ -171,9 +168,9 @@ Device: 0@tcpip://localhost:18965
 
 | Type | Pattern | Example |
 |------|---------|---------|
-| Scripts | `snake_case.m` | `setup_qcar.m` |
-| Functions | `snake_case.m` | `pid_controller.m` |
-| Models | `snake_case.slx` | `vehicle_control.slx` |
+| Scripts | `setup_qcar.m` |
+| Functions | `pid_controller.m` |
+| Models | `vehicle_control.slx` |
 | Test files | `test_*.m` | `test_steering.m` |
 | Data files | `*.mat` | `calibration_data.mat` |
 
@@ -185,7 +182,7 @@ Device: 0@tcpip://localhost:18965
 - Make sure the workspace (Cityscape/Open Road) is fully loaded
 - Check CPS in QLabs settings if things are running slow
 - Stop the Simulink model before closing QLabs
-- Same Simulink model works for both virtual (QLabs) and physical (QCar 2 hardware)
+- **Same Simulink model works for both virtual (QLabs) and physical (QCar 2 hardware)**
 
 ---
 
@@ -202,7 +199,7 @@ To switch from virtual to physical hardware:
 
 > **"Controlling the QCar or gathering data via the `qvl` library functions will invalidate any submission."**
 
-This setup uses **QUARC HIL blocks**, NOT the qvl library. Your autonomous algorithm makes all driving decisions through the Simulink control system.
+This setup uses **QUARC HIL blocks**, NOT the qvl library. Our autonomous algorithm makes all driving decisions through the Simulink control system.
 
 ---
 
