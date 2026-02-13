@@ -72,7 +72,7 @@ def start_pose_logger(qcar2, log_hz=20.0, out_dir=None, min_dist=0.0):
     print(f'Logging QCar2 pose to: {csv_path}')
     return stop_evt, th, csv_path
 
-os.environ.setdefault('RTMODELS_DIR', r"C:\ACC_2026\ACC-Competition-2026\python")
+os.environ.setdefault('RTMODELS_DIR', r"C:\Users\aguil\OneDrive\Desktop\ACC_2026\ACC-Competition-2026\python")
 
 # environment objects
 

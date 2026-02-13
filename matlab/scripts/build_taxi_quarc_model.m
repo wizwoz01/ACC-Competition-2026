@@ -1,12 +1,14 @@
-%% Build Complete Taxi Scenario Model (QUARC + Algorithm)
+%% Build Complete Taxi Scenario Model (QUARC + Algorithm + Lane Detection)
 % Creates a Simulink model that:
 %   1) Reads GPS position from QLabs QCar via QUARC
-%   2) Runs the taxi mission FSM + steering algorithm
-%   3) Writes motor throttle, steering, and LED commands via QUARC
+%   2) Reads front camera image for lane detection
+%   3) Runs lane detection to produce lane center offset
+%   4) Runs the taxi mission FSM + pure pursuit steering + lane keeping
+%   5) Writes motor throttle, steering, and LED commands via QUARC
 %
 % Prerequisites:
 %   - QLabs running with Cityscape workspace
-%   - python/Setup_Real_Scenario.py running (spawns QCar + traffic lights)
+%   - python/Setup_Real_Scenario_fullscale_x10.py running (spawns QCar + traffic lights)
 %   - QUARC toolbox installed
 
 clear; clc;
@@ -14,13 +16,6 @@ clear; clc;
 % -------------------------------------------------------------------------
 % QUARC HIL availability probe
 % -------------------------------------------------------------------------
-% Some QUARC installs include the Simulink blocks but do not include/enable
-% the HIL board support for QCar2 (board type "qcar2"). In that case, the
-% model will fail at compile time inside hil_initialize_block.
-%
-% To keep development moving, we probe the HIL Initialize block up-front.
-% If it cannot compile with qcar2, we generate a model WITHOUT HIL blocks
-% (algorithm-only mode) and print a clear warning.
 useHIL = true;
 try
     load_system('quarc_library');
@@ -47,7 +42,6 @@ try
     if ~added
         useHIL = false;
     else
-        % Try the expected competition settings (parameter names vary by version).
         boardTypeNames = {'board_type', 'BoardType', 'Board', 'board'};
         boardIdNames = {'board_identifier', 'BoardIdentifier', 'Identifier', 'board_id', 'BoardId', 'URI', 'uri'};
         for i = 1:numel(boardTypeNames)
@@ -64,13 +58,10 @@ try
             catch
             end
         end
-        % Force compilation/update.
         set_param(probeModel, 'SimulationCommand', 'update');
     end
 
     close_system(probeModel, 0);
-    % Don't leave QUARC library open (it lives under Program Files and can
-    % trigger autosave permission warnings).
     try, close_system('quarc_library', 0); catch, end
 catch
     useHIL = false;
@@ -79,22 +70,61 @@ catch
 end
 
 if ~useHIL
-    warning(['QCar2 QUARC HIL support not detected (HIL Initialize cannot compile with board type qcar2). ' ...
-             'Building taxi_quarc in algorithm-only mode (no HIL Initialize / no HIL Write). ' ...
+    warning(['QCar2 QUARC HIL support not detected. ' ...
+             'Building taxi_quarc in algorithm-only mode (no HIL blocks). ' ...
              'To run the full QLabs scenario via QUARC, register/install QUARC with QCar2 support.']);
 end
 
+% Resolve project root robustly (handles MATLAB Editor temp directory issue)
 scriptDir = fileparts(mfilename('fullpath'));
-addpath(fullfile(scriptDir, '..', 'functions'));
-addpath(fullfile(scriptDir, '..', 'config'));
+projectRoot = '';
+
+% Strategy 1: mfilename path (works when run from command window)
+candidate = fullfile(scriptDir, '..', 'config', 'vehicle_params.m');
+if exist(candidate, 'file')
+    projectRoot = fullfile(scriptDir, '..');
+end
+
+% Strategy 2: look relative to current working directory
+if isempty(projectRoot)
+    % Try: pwd is the repo root
+    if exist(fullfile(pwd, 'matlab', 'config', 'vehicle_params.m'), 'file')
+        projectRoot = fullfile(pwd, 'matlab');
+    % Try: pwd is matlab/
+    elseif exist(fullfile(pwd, 'config', 'vehicle_params.m'), 'file')
+        projectRoot = pwd;
+    % Try: pwd is matlab/scripts/
+    elseif exist(fullfile(pwd, '..', 'config', 'vehicle_params.m'), 'file')
+        projectRoot = fullfile(pwd, '..');
+    end
+end
+
+% Strategy 3: use 'which' to find a known function on the path
+if isempty(projectRoot)
+    knownFcn = which('taxi_stack_sfun');
+    if ~isempty(knownFcn)
+        projectRoot = fullfile(fileparts(knownFcn), '..');
+    end
+end
+
+% Strategy 4: hardcoded fallback
+if isempty(projectRoot)
+    projectRoot = 'C:/Users/aguil/OneDrive/Desktop/ACC_2026/ACC-Competition-2026/matlab';
+    if ~exist(fullfile(projectRoot, 'config', 'vehicle_params.m'), 'file')
+        error(['Cannot locate project files. Please cd into the repo root or matlab/ directory, ' ...
+               'or run this script from matlab/scripts/.']);
+    end
+end
+
+addpath(fullfile(projectRoot, 'functions'));
+addpath(fullfile(projectRoot, 'config'));
 
 % Load parameters
-run(fullfile(scriptDir, '..', 'config', 'vehicle_params.m'));
-run(fullfile(scriptDir, '..', 'config', 'taxi_scenario_params.m'));
+run(fullfile(projectRoot, 'config', 'vehicle_params.m'));
+run(fullfile(projectRoot, 'config', 'taxi_scenario_params.m'));
 
 model = 'taxi_quarc';
-
-modelFile = fullfile(scriptDir, '..', 'models', [model '.slx']);
+modelFile = fullfile(projectRoot, 'models', [model '.slx']);
 
 if bdIsLoaded(model)
     close_system(model, 0);
@@ -114,7 +144,6 @@ open_system(model);
 x0 = 50; y0 = 50; dx = 200; dy = 80;
 
 %% ==================== HIL Initialize ====================
-% Required for all QUARC communication
 hilInitPath = [model '/HIL_Initialize'];
 hilInitOk = false;
 if useHIL
@@ -123,7 +152,6 @@ if useHIL
             'Position', [x0 y0 x0+150 y0+60]);
         hilInitOk = true;
     catch
-        % Try alternate library path
         try
             add_block('quarc_library/HIL Initialize', hilInitPath, ...
                 'Position', [x0 y0 x0+150 y0+60]);
@@ -133,7 +161,6 @@ if useHIL
     end
 
     if hilInitOk
-        % Try various parameter name variants for board type and identifier
         paramSet = false;
         boardTypeNames = {'board_type', 'BoardType', 'Board', 'board'};
         boardIdNames = {'board_identifier', 'BoardIdentifier', 'Identifier', 'board_id', 'BoardId', 'URI', 'uri'};
@@ -159,15 +186,14 @@ if useHIL
             warning('Could not set HIL Initialize parameters. You may need to configure the block manually.');
         end
     else
-        warning('Could not add HIL Initialize block. QUARC may not be installed. Adding placeholder.');
+        warning('Could not add HIL Initialize block. Adding placeholder.');
         add_block('simulink/Sources/Constant', hilInitPath, 'Position', [x0 y0 x0+80 y0+40], 'Value', '0');
     end
 else
     add_block('simulink/Sources/Constant', hilInitPath, 'Position', [x0 y0 x0+80 y0+40], 'Value', '0');
 end
 
-% Terminate HIL Initialize output (some QUARC versions expose an output port
-% and Simulink warns if it's left unconnected).
+% Terminate HIL Initialize output
 try
     termPath = [model '/HIL_Init_Term'];
     add_block('simulink/Sinks/Terminator', termPath, 'Position', [x0+170 y0+15 x0+190 y0+35]);
@@ -176,7 +202,6 @@ catch
 end
 
 %% ==================== GPS Read ====================
-% GPS provides position [x, y, z] and orientation [roll, pitch, yaw]
 gpsPath = [model '/GPS_Read'];
 gpsOk = false;
 try
@@ -193,7 +218,6 @@ catch
 end
 
 if gpsOk
-    % Try to set URI
     uriNames = {'uri', 'URI', 'Address', 'address', 'Url', 'url'};
     for i = 1:numel(uriNames)
         try
@@ -204,9 +228,7 @@ if gpsOk
     end
 else
     warning('Could not add GPS Stream Read block. Using simulated GPS.');
-    % Simulated GPS: start at hub position [x, y, z, roll, pitch, yaw]
     add_block('simulink/Sources/Constant', gpsPath, 'Position', [x0 y0+2*dy x0+100 y0+2*dy+40]);
-    % Match coordinate scaling used by the scenario (e.g., fullscale x10).
     coord_scale = 1.0;
     try
         if exist('taxi', 'var') && isstruct(taxi) && isfield(taxi, 'coord_scale')
@@ -224,7 +246,6 @@ else
 end
 
 %% ==================== Extract Position and Heading ====================
-% Selector for pos_xy (elements 1,2)
 posSelPath = [model '/Pos_XY_Selector'];
 add_block('simulink/Signal Routing/Selector', posSelPath, 'Position', [x0+dx y0+2*dy x0+dx+60 y0+2*dy+40]);
 set_param(posSelPath, 'NumberOfDimensions', '1');
@@ -234,7 +255,6 @@ set_param(posSelPath, 'IndexOptions', 'Index vector (dialog)');
 set_param(posSelPath, 'Indices', '[1 2]');
 set_param(posSelPath, 'OutputSizes', '2');
 
-% Selector for heading (element 6 = yaw)
 headSelPath = [model '/Heading_Selector'];
 add_block('simulink/Signal Routing/Selector', headSelPath, 'Position', [x0+dx y0+2*dy+50 x0+dx+60 y0+2*dy+90]);
 set_param(headSelPath, 'NumberOfDimensions', '1');
@@ -249,13 +269,102 @@ add_block('simulink/Sources/Clock', [model '/Clock'], 'Position', [x0 y0+4*dy x0
 add_block('simulink/Sources/Constant', [model '/Reset'], 'Position', [x0 y0+5*dy x0+50 y0+5*dy+30], 'Value', '0');
 
 %% ==================== Speed Estimate ====================
-% Derivative of position magnitude for speed estimate (simplified)
-% In practice you'd use wheel encoders or differentiate GPS more carefully
 add_block('simulink/Sources/Constant', [model '/Speed_Est'], 'Position', [x0 y0+3*dy x0+80 y0+3*dy+30], 'Value', '0.1');
 
-%% ==================== Taxi Stack S-Function ====================
+%% ==================== Camera Read (Front Camera) ====================
+% The front camera is on port 18942. Try QUARC Video3D / Stream blocks.
+camPath = [model '/Camera_Read'];
+camOk = false;
+
+% Try QUARC Video3D Capture block (multiple library path candidates)
+if useHIL
+    camLibCandidates = {
+        'quarc_library/Video3D/Video3D Capture',
+        'quarc_library/Devices/Cameras/Video3D Capture',
+        'quarc_library/Communications/UDP/Stream Client/Stream Read'
+    };
+    for i = 1:numel(camLibCandidates)
+        try
+            add_block(camLibCandidates{i}, camPath, ...
+                'Position', [x0 y0+7*dy x0+140 y0+7*dy+60]);
+            camOk = true;
+            % Try to configure for front camera
+            uriNames = {'uri', 'URI', 'Address', 'address', 'Url', 'url'};
+            for j = 1:numel(uriNames)
+                try
+                    set_param(camPath, uriNames{j}, 'tcpip://localhost:18942');
+                    break;
+                catch
+                end
+            end
+            break;
+        catch
+        end
+    end
+end
+
+if ~camOk
+    warning(['Could not add Camera Read block. Using zero lane offset (waypoint-only mode). ' ...
+             'To enable camera-based lane keeping, manually add a Video3D Capture block ' ...
+             'reading port 18942, wire it through lane_detect_sfun, and connect to TaxiStack input 6.']);
+    % Use Constant(0) as fallback - waypoint following will still work
+    % SampleTime left at default (inf = constant) to avoid rate mismatch
+    add_block('simulink/Sources/Constant', camPath, ...
+        'Position', [x0 y0+7*dy x0+80 y0+7*dy+30], 'Value', '0');
+    set_param(camPath, 'OutDataTypeStr', 'double');
+end
+
+%% ==================== Lane Detection S-Function ====================
+% Only add if camera is available; otherwise, wire Constant(0) directly
+laneDetPath = [model '/Lane_Detect'];
+useLaneSfun = false;
+
+if camOk
+    % Add the lane detection S-function
+    laneLibCandidates = { ...
+        'simulink/User-Defined Functions/Level-2 MATLAB S-Function', ...
+        'simulink/User-Defined Functions/Level-2 MATLAB S-Function (Obsolete)', ...
+        'simulink/User-Defined Functions/Level-2 S-Function', ...
+        'simulink/User-Defined Functions/MATLAB Level-2 S-Function' ...
+    };
+    for i = 1:numel(laneLibCandidates)
+        try
+            add_block(laneLibCandidates{i}, laneDetPath, ...
+                'Position', [x0+dx y0+7*dy x0+dx+160 y0+7*dy+50]);
+            useLaneSfun = true;
+            break;
+        catch
+        end
+    end
+
+    if useLaneSfun
+        % Set the function name to our lane_detect_sfun
+        sfunNameCandidates = {'FunctionName', 'MATLABFcn', 'MATLABFile'};
+        for i = 1:numel(sfunNameCandidates)
+            try
+                set_param(laneDetPath, sfunNameCandidates{i}, 'lane_detect_sfun');
+                break;
+            catch
+            end
+        end
+    end
+end
+
+if ~useLaneSfun && camOk
+    % Camera available but couldn't add S-function - use Constant(0)
+    add_block('simulink/Sources/Constant', laneDetPath, ...
+        'Position', [x0+dx y0+7*dy x0+dx+80 y0+7*dy+30], 'Value', '0');
+    set_param(laneDetPath, 'OutDataTypeStr', 'double');
+end
+
+%% ==================== Lane Offset Source ====================
+% Determine what provides the lane_offset signal to TaxiStack
+% If camera + lane detection: Camera -> LaneDetect -> TaxiStack/6
+% If no camera: Constant(0) -> TaxiStack/6
+
+%% ==================== Taxi Stack S-Function (6 inputs) ====================
 sfunPath = [model '/TaxiStack'];
-pos = [x0+2*dx y0+2*dy x0+2*dx+200 y0+2*dy+140];
+pos = [x0+2*dx y0+2*dy x0+2*dx+200 y0+2*dy+160];
 
 added = false;
 libCandidates = { ...
@@ -309,7 +418,6 @@ if useHIL
     end
 
     if hilWriteOk
-        % Try to set channel parameters (names vary by QUARC version)
         try set_param(hilWritePath, 'pwm_channels', '[1000]'); catch, end
         try set_param(hilWritePath, 'PWMChannels', '[1000]'); catch, end
         try set_param(hilWritePath, 'other_channels', '[0]'); catch, end
@@ -359,6 +467,9 @@ add_block('simulink/Sinks/Display', [model '/State_Display'], 'Position', [x0+4*
 add_block('simulink/Sinks/Scope', [model '/Position_Scope'], 'Position', [x0+3*dx y0+dy x0+3*dx+40 y0+dy+40]);
 add_block('simulink/Sinks/Scope', [model '/Commands_Scope'], 'Position', [x0+4*dx y0+dy x0+4*dx+40 y0+dy+40]);
 
+%% ==================== Lane Offset Scope ====================
+add_block('simulink/Sinks/Scope', [model '/LaneOffset_Scope'], 'Position', [x0+3*dx y0+7*dy x0+3*dx+40 y0+7*dy+40]);
+
 %% ==================== Mux for commands ====================
 add_block('simulink/Signal Routing/Mux', [model '/Cmd_Mux'], 'Position', [x0+3.5*dx y0+2*dy+20 x0+3.5*dx+10 y0+2*dy+70]);
 set_param([model '/Cmd_Mux'], 'Inputs', '2');
@@ -368,12 +479,29 @@ set_param([model '/Cmd_Mux'], 'Inputs', '2');
 add_line(model, 'GPS_Read/1', 'Pos_XY_Selector/1');
 add_line(model, 'GPS_Read/1', 'Heading_Selector/1');
 
-% Inputs -> TaxiStack
-add_line(model, 'Pos_XY_Selector/1', 'TaxiStack/1');
-add_line(model, 'Heading_Selector/1', 'TaxiStack/2');
-add_line(model, 'Speed_Est/1', 'TaxiStack/3');
-add_line(model, 'Clock/1', 'TaxiStack/4');
-add_line(model, 'Reset/1', 'TaxiStack/5');
+% Inputs -> TaxiStack (6 inputs)
+add_line(model, 'Pos_XY_Selector/1', 'TaxiStack/1');    % pos_xy
+add_line(model, 'Heading_Selector/1', 'TaxiStack/2');    % heading_rad
+add_line(model, 'Speed_Est/1', 'TaxiStack/3');           % speed_mps
+add_line(model, 'Clock/1', 'TaxiStack/4');               % t
+add_line(model, 'Reset/1', 'TaxiStack/5');               % reset
+
+% Lane offset -> TaxiStack input 6
+if camOk && useLaneSfun
+    % Camera -> LaneDetect -> TaxiStack/6
+    add_line(model, 'Camera_Read/1', 'Lane_Detect/1');
+    add_line(model, 'Lane_Detect/1', 'TaxiStack/6');
+    % Also connect to scope for debugging
+    add_line(model, 'Lane_Detect/1', 'LaneOffset_Scope/1');
+elseif camOk
+    % Camera available but no S-function: use constant(0)
+    add_line(model, 'Lane_Detect/1', 'TaxiStack/6');
+    add_line(model, 'Lane_Detect/1', 'LaneOffset_Scope/1');
+else
+    % No camera: Constant(0) -> TaxiStack/6
+    add_line(model, 'Camera_Read/1', 'TaxiStack/6');
+    add_line(model, 'Camera_Read/1', 'LaneOffset_Scope/1');
+end
 
 % TaxiStack -> Saturations
 add_line(model, 'TaxiStack/1', 'SatSpeed/1');
@@ -405,19 +533,36 @@ save_system(model, modelFile);
 fprintf('\n========================================\n');
 fprintf('Created: matlab/models/taxi_quarc.slx\n');
 fprintf('========================================\n\n');
+fprintf('FEATURES:\n');
+fprintf('- Pure pursuit waypoint following (road-following paths)\n');
+fprintf('- Camera-based lane offset correction (when camera available)\n');
+fprintf('- PID steering controller for smooth lane keeping\n');
+fprintf('- Speed adaptation for turns\n');
+fprintf('- LED color changes per mission state\n\n');
 fprintf('BEFORE RUNNING:\n');
 fprintf('1. Start QLabs (Cityscape workspace)\n');
-fprintf('2. Run: python Setup_Real_Scenario.py\n');
+fprintf('2. Run: python Setup_Real_Scenario_fullscale_x10.py\n');
 fprintf('   (keep it running - spawns QCar + traffic lights)\n');
 fprintf('3. In Simulink: Press Run (Ctrl+T) or click the green Play button\n\n');
-fprintf('EXPECTED BEHAVIOR:\n');
-fprintf('- QCar starts at Taxi Hub with RED LED\n');
-fprintf('- Drives to pickup [0.125, 4.395] with GREEN LED\n');
-fprintf('- Stops, LED turns BLUE (passenger pickup)\n');
-fprintf('- Drives to dropoff [-0.905, 0.800] with GREEN LED\n');
-fprintf('- Stops, LED turns ORANGE (passenger dropoff)\n');
-fprintf('- Returns to Taxi Hub, LED turns RED\n\n');
-fprintf('State Display values:\n');
-fprintf('  0=INIT, 1=GO_PICKUP, 2=STOP_PICKUP,\n');
+fprintf('LED BEHAVIOR:\n');
+fprintf('- RED    : Initializing (5 sec) and waiting at hub\n');
+fprintf('- GREEN  : Navigating (to pickup, dropoff, or hub)\n');
+fprintf('- BLUE   : Stopped at pickup (passenger boarding, 2 sec)\n');
+fprintf('- ORANGE : Stopped at dropoff (passenger exiting, 2 sec)\n\n');
+fprintf('MISSION SEQUENCE:\n');
+fprintf('  Hub [%.1f, %.1f] --(GREEN)--> Pickup [%.1f, %.1f]\n', ...
+    taxi.hub_xy(1)*taxi.coord_scale, taxi.hub_xy(2)*taxi.coord_scale, ...
+    taxi.pickup_xy(1)*taxi.coord_scale, taxi.pickup_xy(2)*taxi.coord_scale);
+fprintf('  Pickup --(BLUE, 2s)--> Dropoff [%.1f, %.1f]\n', ...
+    taxi.dropoff_xy(1)*taxi.coord_scale, taxi.dropoff_xy(2)*taxi.coord_scale);
+fprintf('  Dropoff --(ORANGE, 2s)--> Hub\n\n');
+fprintf('State Display: 0=INIT, 1=GO_PICKUP, 2=STOP_PICKUP,\n');
 fprintf('  3=GO_DROPOFF, 4=STOP_DROPOFF, 5=RETURN_HUB, 6=WAIT_AT_HUB\n');
+if ~camOk
+    fprintf('\nNOTE: Camera not available - using waypoint-only mode.\n');
+    fprintf('To enable camera lane keeping:\n');
+    fprintf('  1. Add a Video3D Capture block (port 18942) for front camera\n');
+    fprintf('  2. Add lane_detect_sfun S-Function block\n');
+    fprintf('  3. Wire: Camera -> LaneDetect -> TaxiStack input 6\n');
+end
 fprintf('========================================\n');

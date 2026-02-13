@@ -16,7 +16,7 @@ def fs_scale(scale):
     # Scale a [sx,sy,sz] list/tuple by COORD_SCALE
     return [COORD_SCALE*scale[0], COORD_SCALE*scale[1], COORD_SCALE*scale[2]]
 
-os.environ.setdefault('RTMODELS_DIR', r"C:\CECS490A\ACC-Competition-2026\python")
+os.environ.setdefault('RTMODELS_DIR', r"C:\Users\aguil\OneDrive\Desktop\ACC_2026\ACC-Competition-2026\python")
 
 # environment objects
 
