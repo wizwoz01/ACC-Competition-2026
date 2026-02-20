@@ -1413,9 +1413,7 @@ def run_scenario(
             # ----------------------------------------------------------
             # 5. Map-based sign proximity checks + Roundabout zone detection
             # ----------------------------------------------------------
-            # Detect roundabout zones: approach (far), entry (approaching), active (in), exit (leaving)
-            # CRITICAL: Start applying keep-right bias EARLY to prevent wrong-way entry
-            rb_approach_zone = False  # NEW: Far approach zone
+            # Detect roundabout zones: entry (approaching), active (in), exit (leaving)
             rb_entry_zone = False
             rb_in_zone = False
             rb_exit_zone = False
@@ -1430,14 +1428,10 @@ def run_scenario(
                         closest_rb_sign = rb_sign
                 
                 if closest_rb_sign is not None:
-                    # Approach zone: far from roundabout (3.5-4.5m away) - START KEEP-RIGHT EARLY
-                    if RB_ENTRY_ZONE_M < min_dist_to_rb <= RB_APPROACH_ZONE_M:
-                        rb_approach_zone = True
-                        rb_entry_zone_until = max(rb_entry_zone_until, t + 4.0)  # Extend entry zone
                     # Entry zone: approaching roundabout (2.0-3.5m away)
-                    elif RB_EXIT_ZONE_M < min_dist_to_rb <= RB_ENTRY_ZONE_M:
+                    if RB_EXIT_ZONE_M < min_dist_to_rb < RB_ENTRY_ZONE_M:
                         rb_entry_zone = True
-                        rb_entry_zone_until = max(rb_entry_zone_until, t + 4.0)  # Longer hold
+                        rb_entry_zone_until = max(rb_entry_zone_until, t + 3.0)
                     # Active zone: in roundabout (< 1.5m from center)
                     elif min_dist_to_rb <= RB_EXIT_ZONE_M:
                         rb_in_zone = True

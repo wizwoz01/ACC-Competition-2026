@@ -15,7 +15,7 @@
 
 ## Setup
 ```powershell
-$env:PYTHONPATH = "C:\<insert-where-quanser-github-is-located>\Quanser_Academic_Resources\0_libraries\python;$env:PYTHONPATH"
+$env:PYTHONPATH = "C:\Quanser_Academic_Resources\0_libraries\python;$env:PYTHONPATH"
 pip install -r requirements.txt
 ```
 
