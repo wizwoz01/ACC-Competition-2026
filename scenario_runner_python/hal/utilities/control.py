@@ -246,3 +246,109 @@ class StanleyController:
             -self.maxSteeringAngle,
             self.maxSteeringAngle
         )
+
+
+class PurePursuitController:
+    """Pure pursuit path follower for waypoints.
+
+    Steers toward a lookahead point on the path. Same interface as StanleyController
+    for drop-in replacement: updatePath, set_waypoint_index, update(p, th, speed),
+    pathComplete, p_ref, th_ref, maxSteeringAngle.
+    """
+    def __init__(self, waypoints, lookahead=0.6, cyclic=False):
+        self.updatePath(waypoints, cyclic)
+        self.maxSteeringAngle = np.pi / 6
+        self.lookahead = float(lookahead)
+        self.p_ref = (0.0, 0.0)
+        self.th_ref = 0.0
+
+    def updatePath(self, waypoints, cyclic):
+        self.wp = np.array(waypoints, dtype=np.float64)
+        if self.wp.size == 0:
+            raise ValueError("Waypoints array cannot be empty")
+        if self.wp.ndim == 2 and self.wp.shape[1] == 2 and self.wp.shape[0] > 2:
+            self.wp = self.wp.T
+        self.N = self.wp.shape[1]
+        if self.N < 2:
+            raise ValueError(f"Waypoints array must have at least 2 points, got {self.N}")
+        self.wpi = 0
+        self.cyclic = cyclic
+        self.pathComplete = False
+
+    def set_waypoint_index(self, i):
+        if self.N < 2:
+            self.wpi = 0
+        else:
+            self.wpi = min(max(0, int(i)), max(0, self.N - 2))
+        self.pathComplete = False
+
+    def update(self, p, th, speed):
+        p = np.array(p, dtype=np.float64)
+        if self.N < 2:
+            return 0.0
+        seg_idx = self.wpi % max(1, self.N - 1)
+        next_idx = (self.wpi + 1) % max(1, self.N - 1)
+        wp_1 = self.wp[:, seg_idx]
+        wp_2 = self.wp[:, next_idx]
+        v = wp_2 - wp_1
+        v_mag = np.linalg.norm(v)
+        if v_mag < 1e-6:
+            if self.cyclic or self.wpi < self.N - 2:
+                self.wpi = (self.wpi + 1) % max(1, self.N - 1)
+            else:
+                self.pathComplete = True
+            return 0.0
+        v_uv = v / v_mag
+        s = np.dot(p - wp_1, v_uv)
+        s = np.clip(s, 0.0, v_mag)
+        ep = wp_1 + v_uv * s
+        # Lookahead point: from ep, advance along path by lookahead distance
+        cur_pt = ep.copy()
+        rem = float(self.lookahead)
+        idx = seg_idx
+        seg_wp1 = wp_1
+        seg_wp2 = wp_2
+        seg_v = v
+        seg_v_mag = v_mag
+        seg_v_uv = v_uv
+        seg_s = s
+        while rem > 1e-6:
+            to_end = seg_v_mag - (np.dot(cur_pt - seg_wp1, seg_v_uv))
+            to_end = max(0.0, to_end)
+            if to_end >= rem:
+                lookahead_pt = cur_pt + seg_v_uv * rem
+                rem = 0.0
+                break
+            rem -= to_end
+            cur_pt = seg_wp2.copy()
+            if not self.cyclic and idx >= self.N - 2:
+                lookahead_pt = seg_wp2.copy()
+                rem = 0.0
+                break
+            idx = (idx + 1) % max(1, self.N - 1)
+            nxt = (idx + 1) % max(1, self.N - 1)
+            seg_wp1 = self.wp[:, idx]
+            seg_wp2 = self.wp[:, nxt]
+            seg_v = seg_wp2 - seg_wp1
+            seg_v_mag = np.linalg.norm(seg_v)
+            if seg_v_mag < 1e-6:
+                lookahead_pt = cur_pt
+                break
+            seg_v_uv = seg_v / seg_v_mag
+        else:
+            lookahead_pt = cur_pt
+        self.p_ref = tuple(lookahead_pt)
+        dx = lookahead_pt[0] - p[0]
+        dy = lookahead_pt[1] - p[1]
+        self.th_ref = np.arctan2(dy, dx)
+        alpha = wrap_to_pi(self.th_ref - th)
+        ld = max(0.3, np.hypot(dx, dy))
+        L_wb = 0.2
+        steering = np.arctan2(2.0 * L_wb * np.sin(alpha), ld)
+        steering = np.clip(steering, -self.maxSteeringAngle, self.maxSteeringAngle)
+        if s >= v_mag - 1e-6:
+            if self.cyclic or self.wpi < self.N - 2:
+                self.wpi = (self.wpi + 1) % max(1, self.N - 1)
+            else:
+                self.pathComplete = True
+        return float(steering)
