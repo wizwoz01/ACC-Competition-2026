@@ -1,0 +1,6 @@
+stop
+yield
+roundabout
+traffic_light_red
+traffic_light_yellow
+traffic_light_green
