@@ -1282,11 +1282,20 @@ def run_scenario(
             # On TO_HUB: only allow forward-progressing resyncs (no stepping back),
             # and cap overly-large forward jumps to a reasonable fraction of the path.
             if active_name == "TO_HUB":
-                if idx < last_set_wp_index:
+                # Use the current PurePursuit index as a base as well as the last
+                # explicitly-set index. This avoids clipping/resync logic using a
+                # stale `last_set_wp_index` value 
+                # which could allow a lookahead jump far ahead.
+                try:
+                    current_wpi = int(getattr(pure_pursuit, "wpi", 0))
+                except Exception:
+                    current_wpi = 0
+                base_idx = max(last_set_wp_index, current_wpi)
+                if idx < base_idx:
                     return
                 max_jump = max(8, int(0.15 * max(1, active_wp.shape[0])))
-                if idx > last_set_wp_index + max_jump:
-                    idx = last_set_wp_index + max_jump
+                if idx > base_idx + max_jump:
+                    idx = base_idx + max_jump
             pure_pursuit.set_waypoint_index(idx)
             last_set_wp_index = idx
         except Exception:
