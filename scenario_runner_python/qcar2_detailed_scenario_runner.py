@@ -1192,7 +1192,7 @@ def run_scenario(
     YIELD_SPEED         = 1.4
     TL_HOLD_S           = 4.0
     TL_YELLOW_SPEED     = 1.4
-    MIN_CRUISE_SPEED    = 2.1   # Minimum forward speed when not in a hard-stop situation
+    MIN_CRUISE_SPEED    = 3.0   # Minimum forward speed when not in a hard-stop situation
 
     stop_sign_active    = False
     stop_sign_stopped_t = 0.0
@@ -1277,8 +1277,12 @@ def run_scenario(
     last_set_wp_index = 0
     def set_waypoint_index_safe(idx):
         nonlocal last_set_wp_index
+        # Hardened setter: clamp index to valid range, avoid backwards resyncs
+        # during TO_HUB and limit overly-large forward jumps that send the
+        # controller far ahead of the vehicle (causes driving off-map).
         try:
             idx = int(idx)
+<<<<<<< Updated upstream
             # On TO_HUB: only allow forward-progressing resyncs (no stepping back),
             # and cap overly-large forward jumps to a reasonable fraction of the path.
             if active_name == "TO_HUB":
@@ -1302,10 +1306,45 @@ def run_scenario(
                     idx = base_idx + max_jump
             # Ensure final index is within the active waypoint bounds.
             idx = max(0, min(int(idx), max(0, active_wp.shape[0] - 1)))
+=======
+        except Exception:
+            return
+
+        # Ensure within path bounds
+        n_wp = max(1, int(active_wp.shape[0]))
+        if idx < 0:
+            idx = 0
+        if idx >= n_wp:
+            idx = n_wp - 1
+
+        # On TO_HUB be conservative: don't step backwards and limit forward jumps
+        if active_name == "TO_HUB":
+            try:
+                current_wpi = int(getattr(pure_pursuit, "wpi", 0))
+            except Exception:
+                current_wpi = 0
+            # Use the largest-seen progress as the base to avoid stale jumps
+            base_idx = max(last_set_wp_index, current_wpi, int(seg_max_idx))
+            if idx < base_idx:
+                if debug_print:
+                    print(f"[NAV] Ignoring backward resync {idx} < base {base_idx}")
+                return
+            # Tighten the allowed forward jump on TO_HUB to avoid huge lookaheads
+            max_jump = max(6, int(0.10 * n_wp))
+            allowed_max = min(base_idx + max_jump, n_wp - 1)
+            if idx > allowed_max:
+                if debug_print:
+                    print(f"[NAV] Clipping resync {idx} -> {allowed_max} (base={base_idx} max_jump={max_jump} n_wp={n_wp})")
+                idx = allowed_max
+
+        # Apply to controller; only update last_set_wp_index on success
+        try:
+>>>>>>> Stashed changes
             pure_pursuit.set_waypoint_index(idx)
             last_set_wp_index = idx
-        except Exception:
-            pass
+        except Exception as e:
+            if debug_print:
+                print(f"[NAV] Failed to set waypoint index {idx}: {e}")
 
     # ------------------------------------------------------------------
     # Pure Pursuit + Vision: blend waypoints with lane for steering
