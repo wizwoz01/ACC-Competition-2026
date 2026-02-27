@@ -1282,31 +1282,6 @@ def run_scenario(
         # controller far ahead of the vehicle (causes driving off-map).
         try:
             idx = int(idx)
-<<<<<<< Updated upstream
-            # On TO_HUB: only allow forward-progressing resyncs (no stepping back),
-            # and cap overly-large forward jumps to a reasonable fraction of the path.
-            if active_name == "TO_HUB":
-                # Use the current PurePursuit index as a base as well as the last
-                # explicitly-set index. This avoids clipping/resync logic using a
-                # stale `last_set_wp_index` value 
-                # which could allow a lookahead jump far ahead.
-                try:
-                    current_wpi = int(getattr(pure_pursuit, "wpi", 0))
-                except Exception:
-                    current_wpi = 0
-                # Clamp base_idx to the current active waypoint range to avoid
-                # carrying over a large index from a previous segment which
-                # could cause huge forward jumps or out-of-range indices.
-                base_idx = max(last_set_wp_index, current_wpi)
-                base_idx = max(0, min(base_idx, max(0, active_wp.shape[0] - 1)))
-                if idx < base_idx:
-                    return
-                max_jump = max(8, int(0.15 * max(1, active_wp.shape[0])))
-                if idx > base_idx + max_jump:
-                    idx = base_idx + max_jump
-            # Ensure final index is within the active waypoint bounds.
-            idx = max(0, min(int(idx), max(0, active_wp.shape[0] - 1)))
-=======
         except Exception:
             return
 
@@ -1339,7 +1314,6 @@ def run_scenario(
 
         # Apply to controller; only update last_set_wp_index on success
         try:
->>>>>>> Stashed changes
             pure_pursuit.set_waypoint_index(idx)
             last_set_wp_index = idx
         except Exception as e:
