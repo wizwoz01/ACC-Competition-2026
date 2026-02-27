@@ -1290,12 +1290,18 @@ def run_scenario(
                     current_wpi = int(getattr(pure_pursuit, "wpi", 0))
                 except Exception:
                     current_wpi = 0
+                # Clamp base_idx to the current active waypoint range to avoid
+                # carrying over a large index from a previous segment which
+                # could cause huge forward jumps or out-of-range indices.
                 base_idx = max(last_set_wp_index, current_wpi)
+                base_idx = max(0, min(base_idx, max(0, active_wp.shape[0] - 1)))
                 if idx < base_idx:
                     return
                 max_jump = max(8, int(0.15 * max(1, active_wp.shape[0])))
                 if idx > base_idx + max_jump:
                     idx = base_idx + max_jump
+            # Ensure final index is within the active waypoint bounds.
+            idx = max(0, min(int(idx), max(0, active_wp.shape[0] - 1)))
             pure_pursuit.set_waypoint_index(idx)
             last_set_wp_index = idx
         except Exception:
