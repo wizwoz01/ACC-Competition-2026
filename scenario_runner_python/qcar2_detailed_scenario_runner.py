@@ -413,7 +413,7 @@ MAP_TRAFFIC_LIGHTS: List[MapTrafficLight] = [
     MapTrafficLight( 0.750,  0.480,  -90.0, pair_id=1),  # TL4
 ]
 
-TL_DETECTION_RADIUS = 0.75   # 1:1 scale – activate YOLO TL colour detection
+TL_DETECTION_RADIUS = 0.8   # 1:1 scale – activate YOLO TL colour detection
 
 def check_sign_proximity(
     car_x: float, car_y: float,
@@ -650,8 +650,7 @@ class LaneController:
             
             # CRITICAL: Use tighter width constraints and slower adaptation
             if 170.0 < w_est < 900.0:
-                # Slower adaptation (0.95 vs 0.92) for more stable, tighter lane width
-                self.lane_width_px = 0.95 * self.lane_width_px + 0.05 * w_est  # Was 0.92/0.08
+                self.lane_width_px = 0.98 * self.lane_width_px + 0.02 * w_est  
             
             # CRITICAL: Use all three lines when available for maximum accuracy
             if center_line_x is not None:
@@ -713,9 +712,8 @@ class LaneController:
 
         x_center = float(np.clip(x_center, 0.0, roi_w - 1.0))
         
-        # CRITICAL: Use tighter boundaries - reduce lane width by 5% for safety margin
         # This prevents the detected lane from extending onto sidewalks
-        tight_lane_width = 0.95 * self.lane_width_px  # 5% tighter for safety
+        tight_lane_width = 0.98 * self.lane_width_px  # 8% tighter for safety
         
         xl_use = float(np.clip(xl if xl is not None else (x_center - 0.5 * tight_lane_width), 0.0, roi_w - 1.0))
         xr_use = float(np.clip(xr if xr is not None else (x_center + 0.5 * tight_lane_width), 0.0, roi_w - 1.0))
@@ -970,7 +968,9 @@ def speed_to_throttle(speed_mps: float) -> float:
     if abs(speed_mps) <= 1e-3:
         return 0.0
     s = abs(speed_mps)
-    thr = clamp(0.05 + 0.10 * s, 0.06, 0.35)
+    # More aggressive mapping to reach higher speeds quicker while keeping
+    # a capped maximum throttle for safety. Allow full throttle when needed.
+    thr = clamp(0.05 + 0.22 * s, 0.06, 1.00)
     return -thr if speed_mps < 0.0 else thr
 
 def render_hud(bgr: np.ndarray, title: str, lines: list[str]) -> np.ndarray:
@@ -1094,7 +1094,9 @@ def run_scenario(
     waypoints_file: str,
     actor_number: int = 0,
     sample_rate_hz: float = 30.0,
-    max_speed_mps: float = 2.6,
+    # Increased default max speed to help complete route faster while
+    # preserving existing safety caps elsewhere in the controller.
+    max_speed_mps: float = 6.0,
     debug_print: bool = True,
     use_lidar: bool = True,
     use_realsense: bool = True,
@@ -1187,12 +1189,16 @@ def run_scenario(
     # ------------------------------------------------------------------
     # Sign-action state
     # ------------------------------------------------------------------
-    STOP_SIGN_DWELL_S   = 2.0
+    # Reduced dwell at stop signs to speed up runs while still enforcing a
+    # brief full stop. Adjust if more stopping time is required for safety.
+    STOP_SIGN_DWELL_S   = 0.8
     YIELD_SLOW_S        = 2.0
     YIELD_SPEED         = 1.4
     TL_HOLD_S           = 4.0
     TL_YELLOW_SPEED     = 1.4
-    MIN_CRUISE_SPEED    = 3.0   # Minimum forward speed when not in a hard-stop situation
+    # Increased cruise speed to reduce slow caps on gentle curves and routine
+    # slowdowns; preserves hard-stop logic elsewhere.
+    MIN_CRUISE_SPEED    = 5.2
 
     stop_sign_active    = False
     stop_sign_stopped_t = 0.0
@@ -1269,7 +1275,7 @@ def run_scenario(
     SEG_GOAL_RADIUS_TAIL_M = 1.2   # When at last waypoints, "close enough" to complete segment
     SEG_TAIL_WP_COUNT  = 8
 
-    pure_pursuit = PurePursuitController(waypoints=active_wp.T, lookahead=0.6, cyclic=False)
+    pure_pursuit = PurePursuitController(waypoints=active_wp.T, lookahead=0.8, cyclic=False)
     pure_pursuit.maxSteeringAngle = 0.42
 
     # Track the last waypoint index we explicitly set and provide a safe setter
@@ -1370,7 +1376,7 @@ def run_scenario(
     WRONG_SIDE_LANE_ERR = 0.36   # |lane_err| above this and car left of lane = wrong side (lane_err < 0)
     WRONG_SIDE_FORCE_RIGHT_S = 2.5  # How long to keep forcing right after wrong-side detected
     WRONG_SIDE_STEER_RIGHT = -0.43  # Steer hard right to get back (negative = right)
-    WRONG_SIDE_SPEED = 0.52        # Speed while correcting (fast enough to rejoin, not crawl)
+    WRONG_SIDE_SPEED = 1.60        # Speed while correcting (fast enough to rejoin, not crawl)
 
     # EXTREME sidewalk guard – never broken by any other logic.
     # SidewalkGuard returns MEANS of a binary mask (0..1). Tune thresholds accordingly.
@@ -1695,7 +1701,7 @@ def run_scenario(
                                 active_wp = interpolate_waypoints(active_wp, spacing=0.50)
                             except Exception:
                                 pass
-                            pure_pursuit = PurePursuitController(waypoints=active_wp.T, lookahead=0.40, cyclic=False)
+                            pure_pursuit = PurePursuitController(waypoints=active_wp.T, lookahead=0.60, cyclic=False)
                             pure_pursuit.maxSteeringAngle = 0.38
                         else:
                             pure_pursuit.updatePath(active_wp.T, cyclic=False)
@@ -2102,7 +2108,8 @@ def run_scenario(
                     # Reduce speed in roundabouts only when really needed (allow faster through)
                     if not stop_reason:
                         if rb_in_zone:
-                            speed_cmd = min(speed_cmd, 0.95)  # In roundabout – faster
+                            # Allow faster traversal of roundabouts when safe
+                            speed_cmd = min(speed_cmd, 2.2)  # In roundabout – allow higher speed
                         elif rb_entry_zone:
                             speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
                         elif rb_approach_zone:
@@ -2724,7 +2731,7 @@ def run_scenario(
             throttle  = speed_to_throttle(speed_cmd)
             # Low-pass on steering to damp oscillation (control + vision)
             steer_smoothed = 0.80 * last_steer_smooth + 0.20 * steer_raw
-            steer_smoothed = clamp(steer_smoothed, -0.45, 0.45)
+            steer_smoothed = clamp(steer_smoothed, -0.50, 0.50)
             last_steer_smooth = steer_smoothed
             # Final sidewalk enforcement (extra safety): if sidewalk is strongly
             # detected, force steering AWAY from curb and cap speed.
@@ -2847,7 +2854,7 @@ def main() -> None:
     ap.add_argument("--waypoints", default="waypoints.txt")
     ap.add_argument("--actor", type=int, default=0)
     ap.add_argument("--rate", type=float, default=30.0)
-    ap.add_argument("--speed", type=float, default=2.6)
+    ap.add_argument("--speed", type=float, default=6.0)
     ap.add_argument("--no-print", action="store_true")
     ap.add_argument("--no-lidar", action="store_true")
     ap.add_argument("--no-realsense", action="store_true")

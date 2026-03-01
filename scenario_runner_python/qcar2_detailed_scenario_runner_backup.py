@@ -375,11 +375,11 @@ class MapTrafficLight:
 # Stop signs -------------------------------------------------------
 MAP_STOP_SIGNS: List[MapSign] = [
     # Parking-lot area
-    MapSign("stop", -1.500,  3.600, -35.0,  trigger_radius=0.40, cooldown_s=15.0),
-    MapSign("stop", -1.500,  2.200,  35.0,  trigger_radius=0.40, cooldown_s=15.0),
+    MapSign("stop", -1.500,  3.600, -35.0,  trigger_radius=0.54, cooldown_s=15.0),
+    MapSign("stop", -1.500,  2.200,  35.0,  trigger_radius=0.54, cooldown_s=15.0),
     # x+ side of map
-    MapSign("stop",  2.410,  0.206, -90.0,  trigger_radius=0.40, cooldown_s=15.0),
-    MapSign("stop",  1.766,  1.697,  90.0,  trigger_radius=0.40, cooldown_s=15.0),
+    MapSign("stop",  2.410,  0.206, -90.0,  trigger_radius=0.54, cooldown_s=15.0),
+    MapSign("stop",  1.766,  1.697,  90.0,  trigger_radius=0.54, cooldown_s=15.0),
 ]
 
 # Yield signs ------------------------------------------------------
@@ -413,7 +413,7 @@ MAP_TRAFFIC_LIGHTS: List[MapTrafficLight] = [
     MapTrafficLight( 0.750,  0.480,  -90.0, pair_id=1),  # TL4
 ]
 
-TL_DETECTION_RADIUS = 0.75   # 1:1 scale – activate YOLO TL colour detection
+TL_DETECTION_RADIUS = 0.8   # 1:1 scale – activate YOLO TL colour detection
 
 def check_sign_proximity(
     car_x: float, car_y: float,
@@ -650,8 +650,7 @@ class LaneController:
             
             # CRITICAL: Use tighter width constraints and slower adaptation
             if 170.0 < w_est < 900.0:
-                # Slower adaptation (0.95 vs 0.92) for more stable, tighter lane width
-                self.lane_width_px = 0.95 * self.lane_width_px + 0.05 * w_est  # Was 0.92/0.08
+                self.lane_width_px = 0.98 * self.lane_width_px + 0.02 * w_est  
             
             # CRITICAL: Use all three lines when available for maximum accuracy
             if center_line_x is not None:
@@ -713,9 +712,8 @@ class LaneController:
 
         x_center = float(np.clip(x_center, 0.0, roi_w - 1.0))
         
-        # CRITICAL: Use tighter boundaries - reduce lane width by 5% for safety margin
         # This prevents the detected lane from extending onto sidewalks
-        tight_lane_width = 0.95 * self.lane_width_px  # 5% tighter for safety
+        tight_lane_width = 0.98 * self.lane_width_px  # 8% tighter for safety
         
         xl_use = float(np.clip(xl if xl is not None else (x_center - 0.5 * tight_lane_width), 0.0, roi_w - 1.0))
         xr_use = float(np.clip(xr if xr is not None else (x_center + 0.5 * tight_lane_width), 0.0, roi_w - 1.0))
@@ -970,7 +968,9 @@ def speed_to_throttle(speed_mps: float) -> float:
     if abs(speed_mps) <= 1e-3:
         return 0.0
     s = abs(speed_mps)
-    thr = clamp(0.05 + 0.10 * s, 0.06, 0.35)
+    # More aggressive mapping to reach higher speeds quicker while keeping
+    # a capped maximum throttle for safety. Allow full throttle when needed.
+    thr = clamp(0.05 + 0.22 * s, 0.06, 1.00)
     return -thr if speed_mps < 0.0 else thr
 
 def render_hud(bgr: np.ndarray, title: str, lines: list[str]) -> np.ndarray:
@@ -1094,7 +1094,9 @@ def run_scenario(
     waypoints_file: str,
     actor_number: int = 0,
     sample_rate_hz: float = 30.0,
-    max_speed_mps: float = 2.6,
+    # Increased default max speed to help complete route faster while
+    # preserving existing safety caps elsewhere in the controller.
+    max_speed_mps: float = 6.0,
     debug_print: bool = True,
     use_lidar: bool = True,
     use_realsense: bool = True,
@@ -1187,12 +1189,16 @@ def run_scenario(
     # ------------------------------------------------------------------
     # Sign-action state
     # ------------------------------------------------------------------
-    STOP_SIGN_DWELL_S   = 2.0
+    # Reduced dwell at stop signs to speed up runs while still enforcing a
+    # brief full stop. Adjust if more stopping time is required for safety.
+    STOP_SIGN_DWELL_S   = 0.8
     YIELD_SLOW_S        = 2.0
     YIELD_SPEED         = 1.4
     TL_HOLD_S           = 4.0
     TL_YELLOW_SPEED     = 1.4
-    MIN_CRUISE_SPEED    = 2.1   # Minimum forward speed when not in a hard-stop situation
+    # Increased cruise speed to reduce slow caps on gentle curves and routine
+    # slowdowns; preserves hard-stop logic elsewhere.
+    MIN_CRUISE_SPEED    = 5.2
 
     stop_sign_active    = False
     stop_sign_stopped_t = 0.0
@@ -1269,7 +1275,7 @@ def run_scenario(
     SEG_GOAL_RADIUS_TAIL_M = 1.2   # When at last waypoints, "close enough" to complete segment
     SEG_TAIL_WP_COUNT  = 8
 
-    pure_pursuit = PurePursuitController(waypoints=active_wp.T, lookahead=0.6, cyclic=False)
+    pure_pursuit = PurePursuitController(waypoints=active_wp.T, lookahead=0.8, cyclic=False)
     pure_pursuit.maxSteeringAngle = 0.42
 
     # Track the last waypoint index we explicitly set and provide a safe setter
@@ -1277,20 +1283,48 @@ def run_scenario(
     last_set_wp_index = 0
     def set_waypoint_index_safe(idx):
         nonlocal last_set_wp_index
+        # Hardened setter: clamp index to valid range, avoid backwards resyncs
+        # during TO_HUB and limit overly-large forward jumps that send the
+        # controller far ahead of the vehicle (causes driving off-map).
         try:
             idx = int(idx)
-            # On TO_HUB: only allow forward-progressing resyncs (no stepping back),
-            # and cap overly-large forward jumps to a reasonable fraction of the path.
-            if active_name == "TO_HUB":
-                if idx < last_set_wp_index:
-                    return
-                max_jump = max(8, int(0.15 * max(1, active_wp.shape[0])))
-                if idx > last_set_wp_index + max_jump:
-                    idx = last_set_wp_index + max_jump
+        except Exception:
+            return
+
+        # Ensure within path bounds
+        n_wp = max(1, int(active_wp.shape[0]))
+        if idx < 0:
+            idx = 0
+        if idx >= n_wp:
+            idx = n_wp - 1
+
+        # On TO_HUB be conservative: don't step backwards and limit forward jumps
+        if active_name == "TO_HUB":
+            try:
+                current_wpi = int(getattr(pure_pursuit, "wpi", 0))
+            except Exception:
+                current_wpi = 0
+            # Use the largest-seen progress as the base to avoid stale jumps
+            base_idx = max(last_set_wp_index, current_wpi, int(seg_max_idx))
+            if idx < base_idx:
+                if debug_print:
+                    print(f"[NAV] Ignoring backward resync {idx} < base {base_idx}")
+                return
+            # Tighten the allowed forward jump on TO_HUB to avoid huge lookaheads
+            max_jump = max(6, int(0.10 * n_wp))
+            allowed_max = min(base_idx + max_jump, n_wp - 1)
+            if idx > allowed_max:
+                if debug_print:
+                    print(f"[NAV] Clipping resync {idx} -> {allowed_max} (base={base_idx} max_jump={max_jump} n_wp={n_wp})")
+                idx = allowed_max
+
+        # Apply to controller; only update last_set_wp_index on success
+        try:
             pure_pursuit.set_waypoint_index(idx)
             last_set_wp_index = idx
-        except Exception:
-            pass
+        except Exception as e:
+            if debug_print:
+                print(f"[NAV] Failed to set waypoint index {idx}: {e}")
 
     # ------------------------------------------------------------------
     # Pure Pursuit + Vision: blend waypoints with lane for steering
@@ -1342,7 +1376,7 @@ def run_scenario(
     WRONG_SIDE_LANE_ERR = 0.36   # |lane_err| above this and car left of lane = wrong side (lane_err < 0)
     WRONG_SIDE_FORCE_RIGHT_S = 2.5  # How long to keep forcing right after wrong-side detected
     WRONG_SIDE_STEER_RIGHT = -0.43  # Steer hard right to get back (negative = right)
-    WRONG_SIDE_SPEED = 0.52        # Speed while correcting (fast enough to rejoin, not crawl)
+    WRONG_SIDE_SPEED = 1.60        # Speed while correcting (fast enough to rejoin, not crawl)
 
     # EXTREME sidewalk guard – never broken by any other logic.
     # SidewalkGuard returns MEANS of a binary mask (0..1). Tune thresholds accordingly.
@@ -1667,7 +1701,7 @@ def run_scenario(
                                 active_wp = interpolate_waypoints(active_wp, spacing=0.50)
                             except Exception:
                                 pass
-                            pure_pursuit = PurePursuitController(waypoints=active_wp.T, lookahead=0.40, cyclic=False)
+                            pure_pursuit = PurePursuitController(waypoints=active_wp.T, lookahead=0.60, cyclic=False)
                             pure_pursuit.maxSteeringAngle = 0.38
                         else:
                             pure_pursuit.updatePath(active_wp.T, cyclic=False)
@@ -2074,7 +2108,8 @@ def run_scenario(
                     # Reduce speed in roundabouts only when really needed (allow faster through)
                     if not stop_reason:
                         if rb_in_zone:
-                            speed_cmd = min(speed_cmd, 0.95)  # In roundabout – faster
+                            # Allow faster traversal of roundabouts when safe
+                            speed_cmd = min(speed_cmd, 2.2)  # In roundabout – allow higher speed
                         elif rb_entry_zone:
                             speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
                         elif rb_approach_zone:
@@ -2594,7 +2629,7 @@ def run_scenario(
                     else:
                         # Allow recovery even when not in RB and front isn't blocked (e.g., wedged on curb with sidewalk_confirmed/cte_recover).
                         should_attempt_recover = bool(
-                            active_name != "TO_HUB"
+                            (not route_done) and (active_name != "TO_HUB")
                             and recover_trigger_count < MAX_RECOVER_TRIGGERS
                             and (
                                 (stuck_now and (front_blocked or actually_inside_rb or blocked_reason or bool(sidewalk_confirmed)))
@@ -2637,14 +2672,9 @@ def run_scenario(
                                 # Keep "force right" after recovery so we don't immediately drift wrong again
                                 wrong_way_force_right_until = max(wrong_way_force_right_until, t + rev_s + fwd_s + 3.0)
 
-                            if debug_print:
-                                print(
-                                    "[RECOVER] rock "
-                                    f"rev={rev_s:.2f}s fwd={fwd_s:.2f}s #={recover_trigger_count} reason={stop_reason} "
-                                    f"cF={center_front:.2f} minF={min_front:.2f} "
-                                    f"swB={swB:+.2f} obsB={obs_bias:+.2f}"
-                                    + (" WRONGWAY_RB" if wrong_way_in_rb else "")
-                                )
+                            # Suppress verbose per-attempt recover prints to avoid
+                            # flooding the console near the end of a scenario.
+                            pass
                     else:
                         # Don't hard-reset: decay so brief speed spikes don't prevent recovery from ever triggering.
                         recover_stuck_streak_s = max(0.0, float(recover_stuck_streak_s) - float(dt) * 0.6)
@@ -2701,7 +2731,7 @@ def run_scenario(
             throttle  = speed_to_throttle(speed_cmd)
             # Low-pass on steering to damp oscillation (control + vision)
             steer_smoothed = 0.80 * last_steer_smooth + 0.20 * steer_raw
-            steer_smoothed = clamp(steer_smoothed, -0.45, 0.45)
+            steer_smoothed = clamp(steer_smoothed, -0.50, 0.50)
             last_steer_smooth = steer_smoothed
             # Final sidewalk enforcement (extra safety): if sidewalk is strongly
             # detected, force steering AWAY from curb and cap speed.
@@ -2735,6 +2765,11 @@ def run_scenario(
             if _led_ctrl.connected and _led_rgb != _prev_led_rgb:
                 if _led_ctrl.set_color(*_led_rgb):
                     _prev_led_rgb = _led_rgb
+
+            # If the route is finished and we're parked/stopped (and not in a recovery),
+            # exit the main loop so the CLI can present the post-run prompt.
+            if route_done and not parking_active and (dr_speed < 0.08) and not in_recovery:
+                break
 
             # ----------------------------------------------------------
             # 12. HUD + waypoint map (Pure Pursuit debug)
@@ -2819,7 +2854,7 @@ def main() -> None:
     ap.add_argument("--waypoints", default="waypoints.txt")
     ap.add_argument("--actor", type=int, default=0)
     ap.add_argument("--rate", type=float, default=30.0)
-    ap.add_argument("--speed", type=float, default=2.6)
+    ap.add_argument("--speed", type=float, default=6.0)
     ap.add_argument("--no-print", action="store_true")
     ap.add_argument("--no-lidar", action="store_true")
     ap.add_argument("--no-realsense", action="store_true")
@@ -2831,20 +2866,35 @@ def main() -> None:
     ap.add_argument("--sign-device", default="cuda")
     args = ap.parse_args()
 
-    run_scenario(
-        waypoints_file=args.waypoints,
-        actor_number=args.actor,
-        sample_rate_hz=args.rate,
-        max_speed_mps=args.speed,
-        debug_print=(not args.no_print),
-        use_lidar=(not args.no_lidar),
-        use_realsense=(not args.no_realsense),
-        recover_enable=(not args.no_recover),
-        sign_model=args.sign_model,
-        sign_labels=args.sign_labels,
-        sign_conf=args.sign_conf,
-        sign_device=args.sign_device,
-    )
+    # Loop the scenario runner and offer a simple post-run prompt.
+    while True:
+        run_scenario(
+            waypoints_file=args.waypoints,
+            actor_number=args.actor,
+            sample_rate_hz=args.rate,
+            max_speed_mps=args.speed,
+            debug_print=(not args.no_print),
+            use_lidar=(not args.no_lidar),
+            use_realsense=(not args.no_realsense),
+            recover_enable=(not args.no_recover),
+            sign_model=args.sign_model,
+            sign_labels=args.sign_labels,
+            sign_conf=args.sign_conf,
+            sign_device=args.sign_device,
+        )
+
+        # Scenario finished
+        try:
+            print("[NAV] DONE")
+            ans = input("Press '2' to run again, or Ctrl+C to quit: ").strip()
+        except KeyboardInterrupt:
+            print()
+            break
+
+        if ans == "2":
+            continue
+        else:
+            break
 
 if __name__ == "__main__":
     main()

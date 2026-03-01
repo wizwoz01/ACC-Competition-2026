@@ -34,9 +34,11 @@ Additional observations or learnings.
 
 | Week | Focus | Status |
 |------|-------|--------|
-| Jan 6, 2026 | Project Setup | 🟢 Complete |
-| Jan 13, 2026 | Environment Config | ⏳ Planned |
-| ... | ... | ... |
+| Jan 6, 2026 | Project Setup (MATLAB initially) | 🟢 Complete |
+| Feb 2, 2026 | Transition architecture to Pure Python | 🟢 Complete |
+| Feb 16, 2026 | Path Planning / Pure Pursuit Control | 🟢 Complete |
+| Mar 1, 2026 | Virtual Stage Submission | 🟢 Complete |
+| ... | Integration into advanced competition tracks | ⏳ Planned |
 
 ---
 

@@ -4,27 +4,19 @@ This directory contains internal documentation for the ACC 2026 competition.
 
 ## Contents
 
-- [Architecture](architecture.md) - System architecture overview
 - [Progress](progress/) - Development progress logs
-- [Meeting Notes](meetings/) - Meeting notes
 
 ## Development Pathway
 
-Using **MATLAB/Simulink** for this competition because:
-- ✅ No NVIDIA GPU required (ThinkPad L13 doesn't have one)
-- ✅ Runs natively on Windows (no Docker/WSL2 complexity)
-- ✅ Great for control systems and rapid prototyping
-- ✅ Simulink is perfect for model-based design
-
-| Pathway | Guide |
-|---------|-------|
-| 🟦 MATLAB | [Development Guide](../Software/Development_Guide.md) |
+This project utilizes a **Pure Python** architecture utilizing Quanser APIs (`hal`, `pal`, and `pit`) alongside PyTorch/Ultralytics because it provides:
+- ✅ Native integration with Quanser simulation variables (localization/spawning).
+- ✅ Unmatched real-time object detection processing speeds.
+- ✅ Single-executable logic pipelines without dealing with Simulink block diagrams or generic ROS containers.
 
 ## Quick Links
 
-- [Main README](../README.md) - Project overview and setup
+- [Main README](../README.md) - Project overview and pure Python setup
 - [Detailed Scenario](../DetailedScenario.md) - Scenario, core principles, submission requirements
-- [Development Guide](../Software/Development_Guide.md) - MATLAB workflow
 
 ---
 

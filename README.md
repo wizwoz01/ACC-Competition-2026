@@ -15,19 +15,18 @@
 
 ## 🏆 Competition Overview
 
-This competition involves creating a self-driving algorithm capable of navigating through **Quanser City** as an autonomous taxi service. The objective is to **maximize profits** within a certain time period by:
+This competition involves creating a self-driving algorithm capable of navigating through **Quanser City** as an autonomous taxi service. The objective is to **complete the Detailed Scenario** within a certain time:
 
 - Navigating to selected pick-up and drop-off coordinates
 - Handling various traffic scenarios while adhering to rules of the road
-- Earning ratings based on ride performance
-- Completing as many profitable rides as possible within the timeframe
+- Based on ride performance
+- Completing scenario within the timeframe
 
 ## 👥 Team Information
 
 | Role | Name | Email |
 |------|------|-------|
-| **Team Captain** | TBD | TBD |
-| **Team Member** | Ricardo Cervantes | ricardo.cervantes01@student.csulb.edu |
+| **Team Captain** | Ricardo Cervantes | ricardo.cervantes01@student.csulb.edu |
 | **Team Member** | Michelle Do | Michelle.Do01@student.csulb.edu |
 | **Team Member** | Gricel Aguilar Quiroz | Gricel.AguilarQuiroz01@student.csulb.edu |
 | **Team Member** | Delsin Carbonell | Delsin.Carbonell01@student.csulb.edu |
@@ -60,7 +59,7 @@ This competition involves creating a self-driving algorithm capable of navigatin
 ### Stage 1: Virtual Design and Submission
 - Develop self-driving algorithms in Quanser's virtual environment (QLabs)
 - Create a video submission demonstrating algorithm capabilities
-- **Deadline:** February 27, 2026
+- **Deadline:** March 1, 2026
 
 ### Stage 2: Physical Implementation
 - Top 6 teams receive physical QCar 2 from Quanser
@@ -77,44 +76,12 @@ This competition involves creating a self-driving algorithm capable of navigatin
 
 ## 💻 Software Stack
 
-Using **MATLAB/Simulink** for this competition. Here's why:
+The project uses a pure **Python-based** architecture, leveraging Quanser's `hal` and `pal` modules alongside PyTorch for real-time perception, localization, and control.
 
-### 🔀 Development Pathways Comparison
-
-| | **MATLAB/Simulink** ✅ | **ROS 2 Humble** |
-|---|---------------------|------------------|
-| **Best For** | Control systems, rapid prototyping | Robotics, multi-sensor fusion |
-| **OS** | Windows 10/11 (native) | Ubuntu 24.04 / WSL2 |
-| **GPU Required** | ❌ No | ✅ Yes (NVIDIA) |
-| **Setup Complexity** | ⭐ Simple | ⭐⭐⭐ Complex |
-| **Docker Required** | ❌ No | ✅ Yes |
-
----
-
-### 🟦 MATLAB Setup
-
-#### Requirements
-- **OS:** Windows 10/11 (native) - Using a ThinkPad L13
-- **Software:** MATLAB R2023a+ with Simulink
-- **Add-on:** Quanser Interactive Labs for MATLAB
-- **Simulation:** Quanser Interactive Labs (QLabs)
-
-#### Development Structure
-```
-├── matlab/                    # MATLAB/Simulink files
-│   ├── models/               # Simulink models
-│   │   ├── vehicle_control.slx
-│   │   ├── path_planning.slx
-│   │   └── perception.slx
-│   ├── scripts/              # MATLAB scripts
-│   │   ├── main.m
-│   │   ├── setup_qcar.m
-│   │   └── utils/
-│   └── config/               # Configuration files
-├── Software/                 # Development guides
-├── Handbook/                 # Competition rules
-└── docs/                     # Documentation
-```
+### Why Pure Python?
+- **Native Integration:** Direct interaction with Quanser's Hardware Abstraction Layer (`hal`) and Platform Abstraction Layer (`pal`).
+- **Advanced Perception:** Seamless deployment of PyTorch (`torch`) and Ultralytics YOLO (`best.torchscript`) models for high-performance object detection.
+- **Unified Pipeline:** Perception, planning, and control reside in a single executable loop (`qcar2_detailed_scenario_runner.py`), eliminating the need to bridge between Simulink block diagrams and Python scripts.
 
 ---
 
@@ -136,66 +103,64 @@ Using **MATLAB/Simulink** for this competition. Here's why:
 
 ## 🚀 Environment Setup
 
-### 1. Install Required Software
-- **MATLAB R2021a+** with Simulink
-- **QUARC** from [Quanser](https://www.quanser.com/products/quarc/) (real-time control software)
-- **QLabs** from [Quanser Interactive Labs](https://www.quanser.com/digital/quanser-interactive-labs/)
-- Register at [Quanser Academic Portal](https://portal.quanser.com/Accounts/Register)
+### 1. Requirements
+- **OS:** Windows 10/11
+- **Python:** Python 3.9+ (Recommended)
+- **Quanser Interactive Labs (QLabs):** [Download QLabs](https://www.quanser.com/digital/quanser-interactive-labs/)
 
-### 2. Install MATLAB Add-on
-```matlab
-% In MATLAB Command Window:
-% Go to Add-Ons → Get Add-Ons → Search "Quanser Interactive Labs for MATLAB"
-% Click "Add" to install
+### 2. Install Dependencies
+Set up the Python environment using the requirements defined in the `scenario_runner_python` module:
+```bash
+# Navigate to the runner directory
+cd scenario_runner_python
+
+# Create a virtual environment (optional but recommended)
+python -m venv venv
+venv\Scripts\activate
+
+# Install strictly defined requirements
+pip install -r requirements.txt
 ```
+*Note: Ensure to install the correct `torch` (PyTorch) wheels compatible with your hardware (CUDA or CPU only) as this affects the YOLO object detection speed.*
 
 ### 3. Launch QLabs
-```matlab
-QLabs.launch     % Launch QLabs from MATLAB
-% Then select Cityscape workspace in QLabs GUI
-```
+Launch the QLabs software and select the **Cityscape**/**Cityscape-lite** workspace.
 
-### 4. Spawn the QCar 2
-Open World workspaces do NOT auto-spawn the QCar. Run the Python spawn script:
+### 4. Spawn the QCar 2 Environment
+Open a terminal and set up the interactive actors (traffic lights, cameras, and vehicle):
 ```bash
 cd python
-pip install -r requirements.txt
-python spawn_qcar.py
+python Setup_Real_Scenario_fullscale_x10.py
 ```
-Keep this script running while using Simulink.
 
-### 6. Configure Simulink Model
-In your Simulink model, add **HIL Initialize** block:
-- **Board type:** `qcar2`
-- **Board identifier:** `0@tcpip://localhost:18960`
-
-### 7. Start Developing!
-- Run `matlab/scripts/setup_qcar.m` to set up environment
-- Create Simulink models with QUARC HIL blocks for vehicle control
-- Test your autonomous algorithms in the QLabs simulation
-- See `matlab/README.md` for detailed QUARC configuration
+### 5. Run the Autonomous Pipeline
+Open a new terminal and execute the primary autonomous loop. This will connect to the spawned QCar and utilize the `PurePursuitController` with YOLO perception:
+```bash
+cd scenario_runner_python
+python qcar2_detailed_scenario_runner.py
+```
 
 ---
 
 ## 📁 Project Structure
 
-```
+```text
 ACC-Competition-2026/
 ├── README.md                 # This file
-├── DetailedScenario.md       # Scenario, core principles, submission requirements
-├── matlab/                   # MATLAB/Simulink development
-│   ├── models/              # Simulink models
-│   ├── scripts/             # MATLAB scripts
-│   └── functions/           # Reusable functions
-├── python/                   # Python scripts (spawning only)
-│   ├── spawn_qcar.py        # Spawn QCar for QUARC control
-│   └── requirements.txt     # Python dependencies
-├── Software/                 # Development guides
-│   ├── README.md
-│   └── Development_Guide.md
-├── Handbook/                 # Competition rules
-│   └── README.md
-└── docs/                     # Documentation
+├── DetailedScenario.md       # Scenario objectives & algorithms overview
+├── python/                   # Scripts for QLabs simulation setup
+│   ├── Setup_Real_Scenario_fullscale_x10.py  # Main spawn script
+│   └── spawn_qcar.py         # Legacy script for generating base QCar
+├── scenario_runner_python/   # Core autonomous execution pipeline
+│   ├── best.torchscript      # Pre-trained YOLO model
+│   ├── qcar2_detailed_scenario_runner.py     # Main execution script
+│   ├── requirements.txt      # Python dependencies
+│   ├── waypoints.txt         # Pre-defined path coordinates
+│   ├── hal/                  # Hardware Abstraction Layer
+│   ├── pal/                  # Platform Abstraction Layer
+│   ├── pit/                  # Perception Image Tools 
+│   └── tools/                # Waypoint/Map utilities
+└── docs/                     # Documentation updates & architecture
     ├── architecture.md
     └── progress/
 ```
@@ -214,11 +179,11 @@ ACC-Competition-2026/
 
 | Date | Milestone | Status |
 |------|-----------|--------|
-| Jan 2026 | Project Setup | 🟢 In Progress |
-| Jan 2026 | Environment Configuration | 🟢 In Progress |
-| Feb 2026 | Basic Navigation | ⏳ Pending |
-| Feb 2026 | Traffic Handling | ⏳ Pending |
-| Feb 2026 | Video Submission | ⏳ Pending |
+| Jan 2026 | Project Setup | 🟢 Complete |
+| Jan 2026 | Environment Configuration | 🟢 Complete |
+| Feb 2026 | Basic Navigation | 🟢 Complete |
+| Feb 2026 | Traffic Handling | 🟢 Complete |
+| Feb 2026 | Video Submission | 🟢 Complete |
 
 ---
 

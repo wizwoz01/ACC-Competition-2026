@@ -2,7 +2,7 @@
 
 ## Competition Objective
 
-Teams will operate an **autonomous taxi service** in Quanser City. The goal is to **maximize profits** by successfully completing passenger rides while adhering to traffic rules and maintaining high customer satisfaction ratings.
+Teams will operate an **autonomous taxi service** in Quanser City. The goal is to **complete the Detailed Scenario** while adhering to traffic rules.
 
 ---
 
@@ -10,10 +10,10 @@ Teams will operate an **autonomous taxi service** in Quanser City. The goal is t
 
 ### Core Tasks
 
-1. **Receive Ride Requests**
+1. **Detailed Scenario**
    - System provides pick-up coordinates
    - System provides drop-off coordinates
-   - Navigate efficiently to maximize earnings
+   - Navigate efficiently
 
 2. **Execute Rides**
    - Navigate to pick-up location
@@ -21,10 +21,9 @@ Teams will operate an **autonomous taxi service** in Quanser City. The goal is t
    - Navigate to drop-off location
    - Complete the ride safely
 
-3. **Maximize Profit**
-   - Complete as many rides as possible within the time limit
-   - Earn higher ratings for better payouts
-   - Avoid penalties that reduce earnings
+3. **Maximize Points**
+   - Complete the scenario within the time limit
+   - Avoid penalties that reduce points
 
 ---
 
@@ -36,42 +35,42 @@ Based on the [Virtual Stage Competition Guide](https://quanser.github.io/student
 A self-driving algorithm must collect and filter information from interoceptive and exteroceptive sensors. Demonstrating the conversion of raw data to meaningful information is critical for making higher-level decisions during an autonomous task.
 
 **Implementation:**
-- [ ] Camera image processing
-- [ ] LIDAR point cloud filtering
-- [ ] Sensor fusion techniques
-- [ ] Data preprocessing pipelines
+- [x] Camera image processing (via `pal.QCarRealSense`)
+- [x] LIDAR point cloud filtering (via `pal.QCarLidar`)
+- [-] Sensor fusion techniques
+- [x] Data preprocessing pipelines
 
 ### 2. Interpretation
 Using system-relevant data, the car must correlate gathered information to factors happening internally or externally in the environment.
 
 **External Factors:**
-- [ ] Traffic sign identification
-- [ ] Traffic light recognition
-- [ ] Pedestrian detection
-- [ ] Other vehicle detection
+- [x] Traffic sign identification (YOLO)
+- [x] Traffic light recognition (YOLO)
+- [x] Pedestrian detection
+- [x] Other vehicle detection
 
 **Internal Factors:**
-- [ ] System state identification
-- [ ] Error monitoring
+- [x] System state identification
+- [x] Error monitoring
 - [ ] Performance tracking
 
 ### 3. Control Systems
 From the set of viable options determined in interpretation, the car must execute accurately on the chosen option.
 
 **Requirements:**
-- [ ] Staying within lanes
-- [ ] Executing turns
-- [ ] Stopping at traffic controls
-- [ ] Altering path based on obstacles
-- [ ] Maintaining desired speed
+- [x] Staying within lanes (Pure Pursuit & OpenCV Edge Detection)
+- [x] Executing turns
+- [x] Stopping at traffic controls (State Machine logic)
+- [x] Altering path based on obstacles (LIDAR)
+- [x] Maintaining desired speed
 
 ### 4. Localization and Path Planning
 The car must understand where it is within the roadmap and determine how to get to another location.
 
 **Requirements:**
-- [ ] Global/local map storage
-- [ ] Position determination in space
-- [ ] Route planning to destinations
+- [x] Global/local map storage (`waypoints.txt` coordinates)
+- [x] Position determination in space (Simulation socket `_QLabsWorldTransform`)
+- [x] Route planning to destinations
 - [ ] Dynamic route adjustment based on:
   - Vehicles on the road
   - Road obstructions
@@ -84,27 +83,27 @@ The car must understand where it is within the roadmap and determine how to get 
 The autonomous vehicle must handle the following traffic scenarios:
 
 ### Basic Navigation
-- [ ] Lane following
-- [ ] Intersection handling
-- [ ] Turn execution (left, right, U-turns)
-- [ ] Speed limit compliance
+- [-] Lane following
+- [x] Intersection handling
+- [x] Turn execution (left, right, U-turns)
+- [-] Speed limit compliance
 
 ### Traffic Control
-- [ ] Traffic light recognition and compliance
-- [ ] Stop sign detection and compliance
-- [ ] Yield sign handling
+- [x] Traffic light recognition and compliance
+- [x] Stop sign detection and compliance
+- [x] Yield sign handling
 - [ ] Pedestrian crosswalk handling
 
 ### Dynamic Obstacles
-- [ ] Other vehicle detection and avoidance
-- [ ] Pedestrian detection and yielding
+- [-] Other vehicle detection and avoidance
+- [-] Pedestrian detection and yielding
 - [ ] Construction zones
 - [ ] Emergency vehicle handling
 
 ### Advanced Scenarios
 - [ ] Merging and lane changes
-- [ ] Roundabout navigation
-- [ ] Parking at pick-up/drop-off locations
+- [x] Roundabout navigation
+- [x] Parking at pick-up/drop-off locations
 
 ---
 
@@ -128,9 +127,9 @@ Teams will be ranked using the following criteria (from [Virtual Stage Competiti
 Based on the [Virtual Stage Competition Guide](https://quanser.github.io/student-competitions/events/common/Rules_and_Objectives/Virtual_Stage_Competition_Guide.html):
 
 ### Submission Checklist
-- [ ] **Video:** Maximum **3-minute** demonstration of self-driving capabilities
-- [ ] **Software:** GitHub link to repository with submission code
-- [ ] **Video Link:** YouTube link demonstrating the code
+- [x] **Video:** Maximum **3-minute** demonstration of self-driving capabilities
+- [x] **Software:** GitHub link to repository with submission code
+- [x] **Video Link:** YouTube link demonstrating the code
 
 ### ⚠️ Critical Rule
 > **Controlling the QCar or gathering data via the `qvl` library functions will invalidate any submission.**
@@ -175,23 +174,22 @@ The coordinate system is consistent for both virtual and physical stages. QLabs 
 ## 🏁 Success Criteria
 
 ### Minimum Requirements
-- [ ] Vehicle can spawn and initialize in QLabs
-- [ ] Basic lane following capability
-- [ ] Stop at traffic lights and stop signs
-- [ ] Complete at least one full ride
+- [x] Vehicle can spawn and initialize in QLabs
+- [x] Basic lane following capability
+- [x] Stop at traffic lights and stop signs
+- [x] Complete at least one full ride
 
 ### Competitive Requirements
-- [ ] Reliable perception across scenarios
-- [ ] Smooth path planning
-- [ ] Efficient route optimization
-- [ ] High ride completion rate
+- [x] Reliable perception across scenarios
+- [x] Smooth path planning
+- [x] Efficient route optimization
+- [x] High ride completion rate
 - [ ] Minimal penalties
 
 ### Excellence Criteria
-- [ ] Robust handling of edge cases
-- [ ] Adaptive behavior
-- [ ] High customer ratings
-- [ ] Innovative approaches
+- [-] Robust handling of edge cases
+- [x] Adaptive behavior
+- [x] Innovative approaches
 
 ---
 
@@ -207,26 +205,26 @@ The coordinate system is consistent for both virtual and physical stages. QLabs 
 ## 🎯 Team Goals - Beach Autonomous Systems
 
 ### Phase 1: Foundation (January 2026)
-- [ ] Complete environment setup
-- [ ] Understand QLabs and QCar 2 interface
-- [ ] Basic vehicle control working
+- [x] Complete environment setup
+- [x] Understand QLabs and QCar 2 interface
+- [x] Basic vehicle control working
 
 ### Phase 2: Perception (January-February 2026)
-- [ ] Camera processing pipeline
-- [ ] LIDAR processing
-- [ ] Object detection (signs, lights, obstacles)
+- [x] Camera processing pipeline (OpenCV Canny edge detection)
+- [x] LIDAR processing (Raycast obstacle detection)
+- [x] Object detection (PyTorch/YOLO for signs and lights)
 
 ### Phase 3: Planning & Control (February 2026)
-- [ ] Path planning implementation
-- [ ] Decision-making logic
-- [ ] Control tuning
+- [x] Path planning implementation (Waypoint interpolation)
+- [x] Decision-making logic (Yield/Stop state machines)
+- [x] Control tuning (hal.PurePursuitController)
 
 ### Phase 4: Integration (February 2026)
-- [ ] Full system integration
-- [ ] Testing and debugging
-- [ ] Video preparation and submission
+- [x] Full system integration
+- [x] Testing and debugging
+- [x] Video preparation and submission
 
 ---
 
-*Last Updated: January 2026*  
+*Last Updated: March 2026*  
 *Beach Autonomous Systems - CSULB*
