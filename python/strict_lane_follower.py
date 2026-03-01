@@ -11,11 +11,25 @@ import math
 import time
 import socket
 import struct
+import os
 from typing import Optional, Tuple, Dict, List
 from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+
+# --- Pure Pursuit integration defaults ---
+from hal.utilities.control import PurePursuitController
+
+PURE_PURSUIT_ENABLED = True
+WAYPOINTS_FILE = "waypoints.txt"
+PURE_PURSUIT_LOOKAHEAD = 2.0
+PP_BASE_BETA = 0.15
+PP_HIGH_BETA = 0.45
+LANE_CONF_THRESHOLD = 0.45
+PP_MAX_STEER = 0.42
+WAYPOINT_SCALE_M = 0.10
+PP_INTERPOLATE_SPACING = 0.5
 
 from pal.products.qcar import QCar
 from pal.utilities.vision import Camera2D
@@ -621,6 +635,13 @@ def check_sign_proximity(
     return True, dist  
 
 
+def detect_adjacent_line(*args, **kwargs):
+    """Stubbed detect_adjacent_line; stop-line logic removed to start fresh.
+    Always returns (False, None, None).
+    """
+    return False, None, None
+
+
 def now() -> float:
     return time.time()
 
@@ -635,7 +656,8 @@ def speed_to_throttle(speed_mps: float) -> float:
     if abs(speed_mps) <= 1e-3:
         return 0.0
     s = abs(speed_mps)
-    thr = clamp(0.05 + 0.10 * s, 0.06, 0.35)
+    # slightly more aggressive mapping to allow higher target speeds
+    thr = clamp(0.06 + 0.12 * s, 0.06, 0.50)
     return -thr if speed_mps < 0.0 else thr
 
 def draw_steer_overlay(img: np.ndarray,
@@ -761,7 +783,7 @@ class RightLaneFollower:
         # --- ROI: wider so you can see the lane through turns ---
         self.roi_top_y_ratio = 0.35        # lower means farther
         self.roi_bottom_y_ratio = 1.00
-        self.roi_top_width_ratio = 0.55   # was ~0.18 (much wider at top)
+        self.roi_top_width_ratio = 0.65   # was ~0.18 (much wider at top)
         self.roi_bottom_width_ratio = 1.02 # was ~0.95 (almost full width)
 
         # --- Edge/Hough params (QLabs lines are clean; keep moderate thresholds) ---
@@ -786,11 +808,38 @@ class RightLaneFollower:
         self.steer_smooth = 0.0
 
         # --- Dropout tolerance ---
-        self.last_good_time = 0.0
+        # Seed last_good_time at construction so the vehicle isn't treated as
+        # long-term lane-lost immediately after spawn.
+        self.last_good_time = time.time()
         self.last_good_steer = 0.0
         self.loss_grace_s = 0.35     # keep driving/steer for short losses
         self.slow_after_s = 0.55     # start slowing after this
         self.stop_after_s = 1.20     # only stop if lane missing this long
+
+        # --- Startup warmup grace ---
+        # Allow a short open-loop throttle while camera/vision warms up.
+        self.start_time = time.time()
+        self.startup_grace_s = 1.0
+        self.startup_throttle = 0.08
+        # aggressive startup mode: allow stronger, less-smoothed steering briefly
+        self.startup_aggressive_s = 1.5
+        self.startup_max_steer_scale = 1.6
+        self.startup_smooth_alpha = 0.40
+        # Startup open-loop turn: apply this steering for a short duration
+        # immediately after spawn to help align into a left-turning lane.
+        # Increase steer magnitude and lower throttle to avoid hitting the curb.
+        # Dramatic startup: perform an in-place steering pivot (zero throttle)
+        # for a longer duration so the vehicle can align to sharply-angled
+        # initial lanes before moving forward.
+        self.startup_turn_s = 3.0
+        # steer value (will be clamped to actuator limits in write())
+        self.startup_turn_steer = 0.60
+        # zero throttle during in-place steering to avoid hitting the curb
+        self.startup_turn_throttle = 0.0
+        # After the open-loop turn, keep speed very low for longer to let the
+        # lane follower stabilise before accelerating.
+        self.startup_post_s = 4.0
+        self.startup_post_speed_mps = 0.20
 
         # Persisted boundary/state for short dropout recovery & right-biasing
         self.last_left = None           # last reliable left x (px)
@@ -865,6 +914,134 @@ class RightLaneFollower:
             return float("nan")
         return (y - b) / m
 
+    # --- Birdseye warp + sliding-window poly helpers (from V2) ---
+    def _init_warp(self, H: int, W: int):
+        self.W = int(W)
+        self.H = int(H)
+        self.src = np.float32([
+            [0.12 * self.W, 1.00 * self.H],
+            [0.40 * self.W, 0.52 * self.H],
+            [0.60 * self.W, 0.52 * self.H],
+            [0.95 * self.W, 1.00 * self.H],
+        ])
+        self.dst = np.float32([
+            [0.17 * self.W, 1.00 * self.H],
+            [0.17 * self.W, 0.00 * self.H],
+            [0.83 * self.W, 0.00 * self.H],
+            [0.83 * self.W, 1.00 * self.H],
+        ])
+        try:
+            self._M = cv2.getPerspectiveTransform(self.src, self.dst)
+        except Exception:
+            self._M = None
+
+    def _warp(self, img: np.ndarray) -> np.ndarray:
+        if img is None or img.size == 0:
+            return img
+        H, W = img.shape[:2]
+        if not hasattr(self, '_M') or self._M is None or self.W != W or self.H != H:
+            self._init_warp(H, W)
+        if getattr(self, '_M', None) is None:
+            return img
+        warped = cv2.warpPerspective(img, self._M, (self.W, self.H), flags=cv2.INTER_LINEAR)
+        return warped
+
+    def _binary_from_canny(self, img: np.ndarray) -> np.ndarray:
+        H, W = img.shape[:2]
+        # color gating
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        h = hsv[:, :, 0]
+        s = hsv[:, :, 1]
+        v = hsv[:, :, 2]
+        L = lab[:, :, 0]
+        white = (L > 195) & (v > 180) & (s < 110)
+        yellow = (h > 12) & (h < 45) & (s > 70) & (v > 90)
+        color_mask = (white | yellow).astype(np.uint8) * 255
+        km = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, km, iterations=1)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, km, iterations=1)
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        gray = cv2.GaussianBlur(gray, (5, 5), 1.1)
+
+        if np.count_nonzero(color_mask) > 500:
+            med = float(np.median(gray[color_mask > 0]))
+        else:
+            med = float(np.median(gray))
+        sigma = 0.50
+        low = int(max(8, (1.0 - sigma) * med))
+        high = int(min(255, (1.0 + sigma) * med))
+        if low >= high:
+            low = max(8, high // 2)
+        edges = cv2.Canny(gray, low, high)
+        edges = cv2.bitwise_and(edges, edges, mask=color_mask)
+        edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+        return edges
+
+    def _fit_poly_from_binary(self, binary: np.ndarray):
+        H, W = binary.shape[:2]
+        nonzero = binary.nonzero()
+        ys = np.array(nonzero[0])
+        xs = np.array(nonzero[1])
+        if xs.size < 400:
+            return None, None, 0.0
+        hist = np.sum(binary[H // 2:, :], axis=0)
+        mid = W // 2
+        leftx_base = int(np.argmax(hist[:mid]))
+        rightx_base = int(np.argmax(hist[mid:]) + mid)
+        n_windows = 9
+        margin = 70
+        minpix = 45
+        window_h = H // n_windows
+        leftx_current = leftx_base
+        rightx_current = rightx_base
+        left_inds = []
+        right_inds = []
+        for w in range(n_windows):
+            y_low = H - (w + 1) * window_h
+            y_high = H - w * window_h
+            if y_low < 0:
+                y_low = 0
+            lx_low = leftx_current - margin
+            lx_high = leftx_current + margin
+            rx_low = rightx_current - margin
+            rx_high = rightx_current + margin
+            good = (ys >= y_low) & (ys < y_high)
+            good_left = good & (xs >= lx_low) & (xs < lx_high)
+            good_right = good & (xs >= rx_low) & (xs < rx_high)
+            left_idx = np.where(good_left)[0]
+            right_idx = np.where(good_right)[0]
+            if left_idx.size > 0:
+                left_inds.append(left_idx)
+            if right_idx.size > 0:
+                right_inds.append(right_idx)
+            if left_idx.size > minpix:
+                leftx_current = int(np.mean(xs[left_idx]))
+            if right_idx.size > minpix:
+                rightx_current = int(np.mean(xs[right_idx]))
+        left_inds = np.concatenate(left_inds) if left_inds else np.array([], dtype=int)
+        right_inds = np.concatenate(right_inds) if right_inds else np.array([], dtype=int)
+        left_fit = None
+        right_fit = None
+        conf = 0.0
+        if left_inds.size > 250:
+            left_fit = np.polyfit(ys[left_inds], xs[left_inds], 2)
+            conf += 0.5
+        if right_inds.size > 250:
+            right_fit = np.polyfit(ys[right_inds], xs[right_inds], 2)
+            conf += 0.5
+        return left_fit, right_fit, float(conf)
+
+    @staticmethod
+    def _x_from_poly(poly, y: float) -> float:
+        if poly is None:
+            return float("nan")
+        a, b, c = poly
+        return float(a * (y ** 2) + b * y + c)
+
     def step(self, bgr: np.ndarray, dt: float, t_now: float, debug: bool = True):
         if bgr is None or bgr.size == 0:
             return 0.0, False, 0.0, None
@@ -929,51 +1106,26 @@ class RightLaneFollower:
         # debug views
         if debug:
             try:
-                cv2.imshow("gray_clahe", gray_clahe)
-                cv2.imshow("color_mask", color_mask)
                 cv2.imshow("canny_edges", edges)
             except Exception:
                 pass
 
-        lines = cv2.HoughLinesP(
-            edges_roi,
-            rho=self.hough_rho,
-            theta=self.hough_theta,
-            threshold=self.hough_thresh,
-            minLineLength=self.hough_min_line_len,
-            maxLineGap=self.hough_max_line_gap,
-        )
+        # Use birdseye warp + sliding-window polynomial fit for curve-friendly lanes
+        warped = self._warp(bgr)
+        if debug:
+            try:
+                # show birdseye (warped) view before edge processing
+                be_vis = warped.copy() if warped is not None else None
+                if be_vis is not None and getattr(be_vis, 'size', 0):
+                    cv2.imshow("birdseye_warp", be_vis)
+            except Exception:
+                pass
+        binary = self._binary_from_canny(warped)
+        left_fit, right_fit, conf = self._fit_poly_from_binary(binary)
 
-        left_segs = []
-        right_segs = []
-
-        if lines is not None:
-            for (x1, y1, x2, y2) in lines[:, 0]:
-                dx = (x2 - x1)
-                dy = (y2 - y1)
-                if abs(dx) < 3:
-                    continue
-                m = dy / dx
-
-                # Reject near-horizontal and absurdly steep noise
-                if abs(m) < 0.30 or abs(m) > 6.0:
-                    continue
-
-                # Classify by slope sign and position:
-                # - Right boundary: positive slope, mostly on right half
-                # - Left boundary: negative slope, mostly on left half
-                if m > 0 and max(x1, x2) > int(0.52 * W):
-                    right_segs.append((x1, y1, x2, y2))
-                elif m < 0 and min(x1, x2) < int(0.48 * W):
-                    left_segs.append((x1, y1, x2, y2))
-
-        # Fit robust single line for each side
-        mL, bL, wL = self._fit_line_from_segments(left_segs)
-        mR, bR, wR = self._fit_line_from_segments(right_segs)
-
-        y_bottom = float(H - 1)
-        xL_bottom = self._x_at_y(mL, bL, y_bottom) if mL is not None else float("nan")
-        xR_bottom = self._x_at_y(mR, bR, y_bottom) if mR is not None else float("nan")
+        y_bottom = float(self.H - 1 if hasattr(self, 'H') and self.H is not None else H - 1)
+        xL_bottom = self._x_from_poly(left_fit, y_bottom) if left_fit is not None else float("nan")
+        xR_bottom = self._x_from_poly(right_fit, y_bottom) if right_fit is not None else float("nan")
 
         have_L = np.isfinite(xL_bottom)
         have_R = np.isfinite(xR_bottom)
@@ -992,6 +1144,19 @@ class RightLaneFollower:
         have_xL = np.isfinite(xL_use)
         have_xR = np.isfinite(xR_use)
 
+        # helper: compute lane angle from polynomial coefficients at a given y
+        def _poly_angle(poly, y_val: float = None):
+            if poly is None:
+                return None
+            if y_val is None:
+                y_val = y_bottom
+            a, b, c = poly
+            # dx/dy = 2a*y + b; angle = atan(dy/dx) = atan(1 / (dx/dy))
+            dxdy = 2.0 * a * float(y_val) + b
+            if abs(dxdy) < 1e-6:
+                return math.pi / 2.0
+            return math.atan(1.0 / dxdy)
+
         if have_xL and have_xR and (xR_use > xL_use + 40):
             # Both sides available -> true center with optional right bias
             w_est = float(xR_use - xL_use)
@@ -1002,32 +1167,49 @@ class RightLaneFollower:
             x_center = 0.5 * (xL_use + xR_use) + offset_px
 
             mode = "LR"
-            conf = clamp((wL + wR) / 900.0, 0.0, 1.0)
+            # confidence returned by polyfit is already 0..1 (0.5 per side)
+            conf = clamp(conf, 0.0, 1.0)
 
-            angL = math.atan(mL) if mL is not None else 0.0
-            angR = math.atan(mR) if mR is not None else 0.0
+            # compute local angle from polynomial derivative: dx/dy = 2a*y + b
+            def _poly_angle(poly):
+                if poly is None:
+                    return 0.0
+                a, b, c = poly
+                dxdy = 2.0 * a * y_bottom + b
+                if abs(dxdy) < 1e-6:
+                    return math.pi / 2.0
+                return math.atan(1.0 / dxdy)
+
+            angL = _poly_angle(left_fit)
+            angR = _poly_angle(right_fit)
             ang = 0.5 * (angL + angR)
         elif have_xR:
             # Right-only fallback; bias toward right side
             bias_term = self.bias_right_px if (self.bias_right_px > 0.0) else (self.target_offset_frac * self.lane_width_px)
             x_center = xR_use - 0.5 * self.lane_width_px + bias_term
             mode = "R"
-            conf = clamp(wR / 650.0, 0.0, 1.0)
-            ang = math.atan(mR) if mR is not None else math.radians(70.0)
+            # If right poly present, use its contribution to confidence
+            conf = clamp(conf, 0.0, 1.0)
+            ang = (_poly_angle(right_fit) if right_fit is not None else math.radians(70.0))
         elif have_xL:
             # Left-only fallback
             bias_term = self.bias_right_px if (self.bias_right_px > 0.0) else (self.target_offset_frac * self.lane_width_px)
             x_center = xL_use + 0.5 * self.lane_width_px + bias_term
             mode = "L"
-            conf = clamp(wL / 650.0, 0.0, 1.0)
-            ang = math.atan(mL) if mL is not None else math.radians(110.0)
+            conf = clamp(conf, 0.0, 1.0)
+            ang = (_poly_angle(left_fit) if left_fit is not None else math.radians(110.0))
         else:
             # No lane this frame -> handle dropout gracefully
             dbg = None
             if debug:
-                dbg = cv2.cvtColor(edges_roi, cv2.COLOR_GRAY2BGR)
-                cv2.putText(dbg, "LANE: LOST", (10, 35),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                # show warped binary when lane lost
+                try:
+                    dbg = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+                except Exception:
+                    dbg = None
+                if dbg is not None:
+                    cv2.putText(dbg, "LANE: LOST", (10, 35),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
             return float(self.last_good_steer), False, 0.0, dbg
 
         x_center = float(np.clip(x_center, 0.0, W - 1.0))
@@ -1043,10 +1225,22 @@ class RightLaneFollower:
         head_err = clamp((nominal - ang), -0.9, 0.9)
 
         steer = self.k_lat * err + self.k_head * head_err + self.kd * derr
-        steer = clamp(steer, -self.max_steer, self.max_steer)
 
-        # smooth
-        self.steer_smooth = 0.78 * self.steer_smooth + 0.22 * steer
+        # Apply startup-aggressive behavior for the first few seconds: allow
+        # larger steering and reduce smoothing so the car can respond to a
+        # sharp initial turn at spawn.
+        startup_active = (t_now - getattr(self, "start_time", 0.0)) <= getattr(self, "startup_aggressive_s", 0.0)
+        if startup_active:
+            alpha = getattr(self, "startup_smooth_alpha", 0.4)
+            max_steer_local = float(getattr(self, "max_steer", 0.6)) * float(getattr(self, "startup_max_steer_scale", 1.0))
+        else:
+            alpha = 0.22
+            max_steer_local = float(self.max_steer)
+
+        steer = clamp(steer, -max_steer_local, max_steer_local)
+
+        # smooth (alpha is weight on new reading)
+        self.steer_smooth = (1.0 - alpha) * self.steer_smooth + alpha * steer
         steer = self.steer_smooth
 
         # mark good
@@ -1066,30 +1260,39 @@ class RightLaneFollower:
             self.last_center = float(x_center)
         except Exception:
             pass
-
         dbg = None
         if debug:
-            dbg = cv2.cvtColor(edges_roi, cv2.COLOR_GRAY2BGR)
-            # show ROI edge
-            roi_edges = cv2.Canny(roi, 50, 150)
-            dbg[roi_edges > 0] = (255, 255, 255)
+            # Visualise warped binary and ROI edges
+            try:
+                dbg = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+            except Exception:
+                dbg = None
+            if dbg is not None:
+                try:
+                    roi_edges = cv2.Canny(roi, 50, 150)
+                    dbg[roi_edges > 0] = (255, 255, 255)
+                except Exception:
+                    pass
 
-            # draw fitted lines
-            def draw_line(m, b, color):
-                if m is None or b is None:
-                    return
-                y1 = int(0.55 * H)
-                y2 = H - 1
-                x1 = int(self._x_at_y(m, b, y1))
-                x2 = int(self._x_at_y(m, b, y2))
-                if 0 <= x1 < W and 0 <= x2 < W:
-                    cv2.line(dbg, (x1, y1), (x2, y2), color, 3)
+                # draw fitted polynomials
+                def draw_poly(poly, color):
+                    if poly is None:
+                        return
+                    y1 = int(0.55 * H)
+                    y2 = H - 1
+                    try:
+                        x1 = int(self._x_from_poly(poly, y1))
+                        x2 = int(self._x_from_poly(poly, y2))
+                        if 0 <= x1 < W and 0 <= x2 < W:
+                            cv2.line(dbg, (x1, y1), (x2, y2), color, 3)
+                    except Exception:
+                        pass
 
-            draw_line(mL, bL, (255, 0, 0))   # left = blue
-            draw_line(mR, bR, (0, 255, 0))   # right = green
+                draw_poly(left_fit, (255, 0, 0))
+                draw_poly(right_fit, (0, 255, 0))
 
-            yb = H - 6
-            cv2.circle(dbg, (int(x_center), yb), 7, (0, 0, 255), -1)
+                yb = H - 6
+                cv2.circle(dbg, (int(x_center), yb), 7, (0, 0, 255), -1)
 
             # draw persisted bound markers if present
             if self.last_left is not None:
@@ -1125,6 +1328,16 @@ def run_lane_only(actor: int, rate_hz: float, speed_mps: float, debug: bool,
         frameRate=rate_hz,
     )
 
+    # ensure a persistent camera window exists so we can always show the view
+    try:
+        cv2.namedWindow("camera", cv2.WINDOW_NORMAL)
+    except Exception:
+        pass
+    # dedicated waypoint/map window for PurePursuit visualization
+    try:
+        cv2.namedWindow("waypoint_map", cv2.WINDOW_NORMAL)
+    except Exception:
+        pass
     follower = RightLaneFollower()
 
     # --- LIDAR init & mapper ---
@@ -1141,30 +1354,87 @@ def run_lane_only(actor: int, rate_hz: float, speed_mps: float, debug: bool,
         qlabs = _QLabsWorldTransform(actor=actor)
     except Exception:
         qlabs = None
+    # Seed an initial steering bias from the spawn heading if QLabs is available.
+    if qlabs is not None and getattr(qlabs, "connected", False):
+        try:
+            ok, loc, rot, _ = qlabs.get_world_transform()
+            if ok:
+                yaw = float(rot[2])
+                # Map yaw to an initial steer bias (heuristic). Positive steer => LEFT.
+                steer_bias = float(math.sin(yaw)) * 0.35
+                follower.last_good_steer = clamp(steer_bias, -follower.max_steer, follower.max_steer)
+                follower.last_good_time = time.time()
+        except Exception:
+            pass
+    # --- PurePursuit init (optional) ---
+    pure_pursuit = None
+    if PURE_PURSUIT_ENABLED:
+        try:
+            wps = load_waypoints_txt(WAYPOINTS_FILE)
+            if wps:
+                first_key = next(iter(wps))
+                pts = wps[first_key]
+                try:
+                    pts_i = interpolate_waypoints(pts, spacing=PP_INTERPOLATE_SPACING)
+                except Exception:
+                    pts_i = np.array(pts)
+                pts_scaled = np.array(pts_i, dtype=np.float64) * WAYPOINT_SCALE_M
+                if pts_scaled.ndim == 2 and pts_scaled.shape[0] == 2:
+                    wp_for_pp = pts_scaled
+                else:
+                    wp_for_pp = pts_scaled.T
+                pure_pursuit = PurePursuitController(wp_for_pp, lookahead=PURE_PURSUIT_LOOKAHEAD, cyclic=False)
+                pure_pursuit.maxSteeringAngle = PP_MAX_STEER
+                print(f"[PP] loaded {WAYPOINTS_FILE} path='{first_key}' pts={wp_for_pp.shape}")
+        except Exception as e:
+            print(f"[PP] init failed: {e}")
+            pure_pursuit = None
     # --- Sign detection / response state ---
     sign_model_obj = None
     sign_names: List[str] = []
     sign_frame_q: "queue.Queue" = queue.Queue(maxsize=1)
     sign_worker_stop = threading.Event()
     sign_state = {
-        'stop_sign_active': False,
-        'stop_sign_stopped_t': 0.0,
+        # sign/tl bookkeeping (stop-sign logic removed)
         'yield_slow_until': 0.0,
         'tl_red_until': 0.0,
         'tl_yellow_until': 0.0,
         'tl_green_until': 0.0,
         'sign_last_trigger': {},
+        'last_detection': None,
+        'print_last': {},
     }
+    # frame counter used to respect sign_stride
+    sign_frame_count = 0
     sign_lock = threading.Lock()
-    # tuning constants
-    STOP_SIGN_DWELL_S = 3.0
+    # tuning constants (stop-sign/stop-line logic removed)
     YIELD_SPEED = 1.0
+    # how recent an image detection must be (seconds) to be considered for map-trigger
+    DETECTION_RECENT_S = 1.0
     # attempt to load sign model if provided
+    # if no model path provided, try to auto-find a model in sign_model/run/weights
+    if sign_model_path is None:
+        try:
+            repo_root = os.path.dirname(__file__)
+            candidate = os.path.join(repo_root, 'sign_model', 'run', 'weights', 'best.torchscript')
+            if os.path.exists(candidate):
+                sign_model_path = candidate
+                print(f"[SIGN] auto-selected model: {sign_model_path}")
+        except Exception:
+            pass
+
     if sign_model_path is not None:
         try:
             from ultralytics import YOLO
             try:
-                sign_model_obj = YOLO(sign_model_path)
+                # explicit task avoids the "Unable to automatically guess model task" warning
+                sign_model_obj = YOLO(sign_model_path, task='detect')
+            except TypeError:
+                # older ultralytics may not accept task kwarg at load; try without
+                try:
+                    sign_model_obj = YOLO(sign_model_path)
+                except Exception:
+                    sign_model_obj = None
             except Exception:
                 sign_model_obj = None
         except Exception:
@@ -1176,6 +1446,43 @@ def run_lane_only(actor: int, rate_hz: float, speed_mps: float, debug: bool,
         except Exception:
             sign_names = []
 
+    # if labels file missing, try to extract names from the model and write them out
+    if not sign_names and sign_model_obj is not None:
+        try:
+            names_attr = None
+            if hasattr(sign_model_obj, 'names'):
+                names_attr = sign_model_obj.names
+            elif hasattr(sign_model_obj, 'model') and hasattr(sign_model_obj.model, 'names'):
+                names_attr = sign_model_obj.model.names
+            if names_attr:
+                if isinstance(names_attr, dict):
+                    # dict mapping idx->name
+                    sign_names = [names_attr[i] for i in sorted(names_attr.keys())]
+                elif isinstance(names_attr, (list, tuple)):
+                    sign_names = list(names_attr)
+                # try to write labels file for future runs
+                try:
+                    with open(sign_labels_path, 'w', encoding='utf-8') as fh:
+                        fh.write('\n'.join(sign_names))
+                    print(f"[SIGN] extracted {len(sign_names)} class names from model and wrote {sign_labels_path}")
+                except Exception:
+                    print(f"[SIGN] extracted {len(sign_names)} class names from model (not written to file)")
+        except Exception:
+            pass
+
+    # report model/labels availability for debugging
+    try:
+        print(f"[SIGN] model={'present' if sign_model_obj is not None else 'none'} path={sign_model_path}")
+        if sign_names:
+            print(f"[SIGN] labels_loaded={len(sign_names)} sample={sign_names[:8]}")
+        else:
+            if sign_model_path is not None:
+                print(f"[SIGN] labels file missing or empty: {sign_labels_path}")
+            else:
+                print("[SIGN] no sign model configured; using image heuristics only")
+    except Exception:
+        pass
+
     def _sign_worker():
         """Background worker: consumes RGB frames (numpy) from `sign_frame_q` and
         runs YOLO inference to set traffic-light state timestamps in `sign_state`.
@@ -1186,31 +1493,97 @@ def run_lane_only(actor: int, rate_hz: float, speed_mps: float, debug: bool,
             except Exception:
                 continue
             if sign_model_obj is None:
+                # should not normally run without a model, but guard defensively
+                try:
+                    if now() - sign_state.get('print_last', {}).get('worker_no_model', 0.0) > 2.0:
+                        print("[SIGN][WORKER] sign_model_obj is None, worker idle")
+                        sign_state.setdefault('print_last', {})['worker_no_model'] = now()
+                except Exception:
+                    pass
                 continue
             try:
                 results = sign_model_obj.predict(source=rgb, conf=sign_conf, device=sign_device, verbose=False)
-                for r in results:
-                    boxes = getattr(r, 'boxes', None)
-                    if boxes is None:
-                        continue
-                    for b in boxes:
-                        try:
-                            cls_idx = int(b.cls[0].item()) if hasattr(b, 'cls') else int(getattr(b, 'cls'))
-                        except Exception:
-                            continue
-                        name = sign_names[cls_idx] if 0 <= cls_idx < len(sign_names) else None
-                        if name is None:
-                            continue
-                        with sign_lock:
-                            texp = now() + 2.0
-                            if 'red' in name:
-                                sign_state['tl_red_until'] = max(sign_state['tl_red_until'], texp)
-                            elif 'yellow' in name:
-                                sign_state['tl_yellow_until'] = max(sign_state['tl_yellow_until'], texp)
-                            elif 'green' in name:
-                                sign_state['tl_green_until'] = max(sign_state['tl_green_until'], texp)
+            except Exception as e:
+                try:
+                    if now() - sign_state.get('print_last', {}).get('worker_err', 0.0) > 2.0:
+                        print(f"[SIGN][WORKER] model predict error: {e}")
+                        sign_state.setdefault('print_last', {})['worker_err'] = now()
+                except Exception:
+                    pass
+                continue
+
+            # process first result
+            try:
+                r = results[0]
             except Exception:
-                pass
+                r = None
+            if r is None:
+                continue
+
+            boxes = getattr(r, 'boxes', None)
+            dets = []
+            if boxes is not None:
+                # try v8 style attributes
+                xyxy = getattr(boxes, 'xyxy', None)
+                confs = getattr(boxes, 'conf', None)
+                clsarr = getattr(boxes, 'cls', None)
+                if xyxy is not None and confs is not None and clsarr is not None:
+                    try:
+                        for idx in range(len(confs)):
+                            try:
+                                row_xy = xyxy[idx]
+                                x1, y1, x2, y2 = int(row_xy[0].item()), int(row_xy[1].item()), int(row_xy[2].item()), int(row_xy[3].item())
+                                confv = float(confs[idx].item()) if hasattr(confs[idx], 'item') else float(confs[idx])
+                                clsidx = int(clsarr[idx].item()) if hasattr(clsarr[idx], 'item') else int(clsarr[idx])
+                                label = sign_names[clsidx] if 0 <= clsidx < len(sign_names) else str(clsidx)
+                                dets.append((label, confv, (x1, y1, x2, y2)))
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+
+            # fallback to boxes.data
+            if not dets:
+                data = getattr(boxes, 'data', None)
+                if data is not None:
+                    try:
+                        arr = data.cpu().numpy() if hasattr(data, 'cpu') else np.array(data)
+                        for row in arr:
+                            try:
+                                x1, y1, x2, y2, confv, clsidx = row[:6]
+                                label = sign_names[int(clsidx)] if 0 <= int(clsidx) < len(sign_names) else str(int(clsidx))
+                                dets.append((label, float(confv), (int(x1), int(y1), int(x2), int(y2))))
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+
+            if not dets:
+                # no detections - be silent (main loop will act on recent detections only)
+                continue
+
+            dets.sort(key=lambda x: x[1], reverse=True)
+            label, confv, bbox = dets[0]
+
+            # heuristics (loosened for higher recall during debugging)
+            H = rgb.shape[0]
+            _, _, bx2, by2 = bbox
+            bbox_bottom_near = (by2 >= int(0.55 * H))
+            bbox_area = max(1, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+            img_area = max(1, rgb.shape[0] * rgb.shape[1])
+            bbox_rel_area = bbox_area / float(img_area)
+
+            now_t = now()
+            # write a compact, timestamped detection record only; main loop will decide actions
+            with sign_lock:
+                sign_state['last_detection'] = {
+                    'label': label,
+                    'conf': confv,
+                    'bbox': bbox,
+                    't': now_t,
+                    'rel_area': bbox_rel_area,
+                    'bottom_near': bbox_bottom_near,
+                }
 
     sign_worker_thread = None
     if sign_model_obj is not None:
@@ -1220,6 +1593,10 @@ def run_lane_only(actor: int, rate_hz: float, speed_mps: float, debug: bool,
     last_world_pos = None  # (x,y)
     last_world_t = 0.0
     movement_heading = None
+    # last observed speed (m/s)
+    last_world_speed = 0.0
+    # PurePursuit blending smooth state
+    pp_beta_smooth = float(PP_BASE_BETA)
 
     if use_lidar:
         try:
@@ -1288,8 +1665,16 @@ def run_lane_only(actor: int, rate_hz: float, speed_mps: float, debug: bool,
                 bgr = None
 
             if bgr is None or not getattr(bgr, "size", 0):
-                # no camera: stop
-                car.read_write_std(throttle=0.0, steering=0.0)
+                # no camera: during a short startup warmup window allow a small
+                # open-loop forward throttle so the car doesn't dead-start while
+                # the camera or first frames arrive. After the grace window,
+                # behave as before and stop.
+                if (t - getattr(follower, "start_time", 0.0)) <= getattr(follower, "startup_grace_s", 0.0):
+                    thr = getattr(follower, "startup_throttle", 0.0)
+                    steer = float(getattr(follower, "last_good_steer", 0.0))
+                    car.read_write_std(throttle=thr, steering=steer)
+                else:
+                    car.read_write_std(throttle=0.0, steering=0.0)
                 time.sleep(dt_nom)
                 continue
 
@@ -1324,6 +1709,11 @@ def run_lane_only(actor: int, rate_hz: float, speed_mps: float, debug: bool,
                                         dist2 = dx * dx + dy * dy
                                         if dist2 > 1e-6:
                                             movement_heading = math.atan2(dy, dx)
+                                            # estimate speed (m/s)
+                                            try:
+                                                last_world_speed = math.sqrt(dist2) / dtp
+                                            except Exception:
+                                                last_world_speed = 0.0
                                 last_world_pos = (x, y)
                                 last_world_t = t_pose
                         except Exception:
@@ -1333,6 +1723,21 @@ def run_lane_only(actor: int, rate_hz: float, speed_mps: float, debug: bool,
                     pass
 
             t_now = now()
+            # Startup open-loop turn: if within startup_turn_s, apply a left-turn
+            # (positive steer) while moving forward slightly to align into the
+            # initial left-turning lane. This runs before lane-follower logic.
+            if (t - getattr(follower, "start_time", 0.0)) <= getattr(follower, "startup_turn_s", 0.0):
+                # use a lower throttle specifically for the turn
+                thr = getattr(follower, "startup_turn_throttle", getattr(follower, "startup_throttle", 0.0))
+                steer_cmd = float(getattr(follower, "startup_turn_steer", 0.0))
+                # clamp open-loop steer to allowable startup max to avoid exceeding
+                # actuator limits (and match aggressive-mode scaling)
+                max_allowed = float(getattr(follower, "max_steer", 0.6)) * float(getattr(follower, "startup_max_steer_scale", 1.0))
+                steer_cmd = clamp(steer_cmd, -max_allowed, max_allowed)
+                car.read_write_std(throttle=thr, steering=steer_cmd)
+                # continue loop to maintain open-loop behavior for this frame
+                time.sleep(dt_nom)
+                continue
             steer_cmd, lane_ok, conf, dbg = follower.step(bgr, dt, t_now=t_now, debug=debug)
 
             time_since_good = t_now - follower.last_good_time
@@ -1350,18 +1755,33 @@ def run_lane_only(actor: int, rate_hz: float, speed_mps: float, debug: bool,
                 # only stop if truly lost for a while
                 v_cmd = 0.0
 
+            # post-startup speed cap: while within startup_post_s after spawn,
+            # limit commanded speed so the vehicle doesn't surge forward too
+            # quickly before the lane follower has stabilised.
+            if (t - getattr(follower, "start_time", 0.0)) <= getattr(follower, "startup_post_s", 0.0):
+                v_cap = float(getattr(follower, "startup_post_speed_mps", 0.0))
+                v_cmd = min(v_cmd, v_cap)
+
+            # (lane-derived v_cmd logging removed to avoid console spam)
+
             # --- Sign handling (map proximity + optional YOLO TL detection) ---
             try:
                 # push frame to sign worker at reduced rate
                 if sign_model_obj is not None:
-                    sign_frame_q.put_nowait(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+                    sign_frame_count += 1
+                    if (sign_frame_count % max(1, sign_stride)) == 0:
+                        try:
+                            sign_frame_q.put_nowait(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+                        except Exception:
+                            try:
+                                _ = sign_frame_q.get_nowait()
+                                sign_frame_q.put_nowait(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+                            except Exception:
+                                pass
             except Exception:
-                try:
-                    # replace queued frame if full
-                    _ = sign_frame_q.get_nowait()
-                    sign_frame_q.put_nowait(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-                except Exception:
-                    pass
+                pass
+
+            # image-only stop-line logic removed (clean start)
 
             # map-based proximity triggers (use world pose if available)
             try:
@@ -1380,77 +1800,266 @@ def run_lane_only(actor: int, rate_hz: float, speed_mps: float, debug: bool,
                         last_t = sign_state['sign_last_trigger'].get(i, 0.0)
                         if now() - last_t < ms.cooldown_s:
                             continue
-                        sign_state['sign_last_trigger'][i] = now()
-                        if ms.sign_type == 'stop':
-                            sign_state['stop_sign_active'] = True
-                            sign_state['stop_sign_stopped_t'] = 0.0
-                        elif ms.sign_type == 'yield':
-                            sign_state['yield_slow_until'] = max(sign_state['yield_slow_until'], now() + 3.0)
+
+                        # consult most recent image detection (if any)
+                        with sign_lock:
+                            last_det = sign_state.get('last_detection', None)
+                        # decide whether we require a recent image confirmation for this sign
+                        require_image = True
+                        lname = ''
+                        if require_image:
+                            if last_det is None or (now() - last_det.get('t', 0.0)) > DETECTION_RECENT_S:
+                                # no recent image confirmation; skip
+                                continue
+                            lname = str(last_det.get('label', '')).lower()
+                        # Stop-sign / stop-line logic removed; only handle other sign types
+                        if ms.sign_type == 'yield':
+                            if 'yield' in lname:
+                                sign_state['sign_last_trigger'][i] = now()
+                                sign_state['yield_slow_until'] = max(sign_state['yield_slow_until'], now() + 3.0)
+                                if now() - sign_state.get('print_last', {}).get(i, 0.0) > 0.5:
+                                    print(f"[SIGN] YIELD triggered (map+image) dist={dist:.2f}")
+                                    sign_state.setdefault('print_last', {})[i] = now()
                         elif ms.sign_type == 'roundabout':
-                            # roundabout handling could set steer bias; ignore for now
                             pass
             except Exception:
                 pass
 
             # apply sign state to v_cmd (under lock)
             try:
+                prev_v = v_cmd
+                applied = []
                 with sign_lock:
                     tcur = now()
+                    prev_yield = (tcur < sign_state.get('yield_slow_until', 0.0))
+                    prev_tl_red = (tcur < sign_state.get('tl_red_until', 0.0))
                     # traffic light red overrides
                     if tcur < sign_state.get('tl_red_until', 0.0):
                         v_cmd = 0.0
-                    # stop sign active: ensure dwell
-                    if sign_state.get('stop_sign_active', False):
-                        if sign_state.get('stop_sign_stopped_t', 0.0) <= 0.0:
-                            sign_state['stop_sign_stopped_t'] = tcur
-                            v_cmd = 0.0
-                        else:
-                            if (tcur - sign_state['stop_sign_stopped_t']) >= STOP_SIGN_DWELL_S:
-                                sign_state['stop_sign_active'] = False
-                                sign_state['stop_sign_stopped_t'] = 0.0
+                        applied.append('TL_RED')
                     # yield slows
                     if tcur < sign_state.get('yield_slow_until', 0.0):
-                        v_cmd = min(v_cmd, YIELD_SPEED)
+                        if v_cmd > YIELD_SPEED:
+                            v_cmd = min(v_cmd, YIELD_SPEED)
+                            applied.append('YIELD')
+
+                    # Print transitions: yield -> resume, tl red -> resume
+                    now_after = now()
+                    cur_yield = (now_after < sign_state.get('yield_slow_until', 0.0))
+                    cur_tl_red = (now_after < sign_state.get('tl_red_until', 0.0))
+                    if prev_yield and not cur_yield:
+                        print(f"[SIGN] Resumed from YIELD at t={now_after:.2f}")
+                    if prev_tl_red and not cur_tl_red:
+                        print(f"[SIGN] Traffic light cleared (resume) at t={now_after:.2f}")
+                # (sign-rule v_cmd logging removed to avoid console spam)
             except Exception:
                 pass
 
+            # --- PurePursuit blending (soft) ---
+            steer_pp = None
+            if PURE_PURSUIT_ENABLED and pure_pursuit is not None:
+                try:
+                    if 'pose' in locals() and pose is not None:
+                        px, py, pyaw = pose
+                    elif last_world_pos is not None:
+                        px, py = last_world_pos[0], last_world_pos[1]
+                        pyaw = movement_heading if movement_heading is not None else 0.0
+                    else:
+                        px = py = pyaw = None
+                    if px is not None:
+                        speed_est = float(last_world_speed) if last_world_speed is not None else 0.0
+                        steer_pp = float(pure_pursuit.update(np.array([px, py]), pyaw, speed_est))
+                except Exception:
+                    steer_pp = None
+
+            # blending weight (smoothed to avoid oscillation)
+            target_beta = float(PP_HIGH_BETA) if (not lane_ok or conf < LANE_CONF_THRESHOLD) else float(PP_BASE_BETA)
+            try:
+                pp_beta_smooth = 0.90 * float(pp_beta_smooth) + 0.10 * float(target_beta)
+            except Exception:
+                pp_beta_smooth = float(target_beta)
+
+            if steer_pp is not None:
+                steer_blend = (1.0 - pp_beta_smooth) * float(steer_cmd) + pp_beta_smooth * float(steer_pp)
+            else:
+                steer_blend = float(steer_cmd)
+            steer_blend = clamp(steer_blend, -float(PP_MAX_STEER), float(PP_MAX_STEER))
+
             throttle = speed_to_throttle(v_cmd)
 
-            # Extra smoothing at actuation
-            steer_smooth = 0.80 * steer_smooth + 0.20 * steer_cmd
+            # Extra smoothing at actuation (apply to blended steer)
+            steer_smooth = 0.80 * steer_smooth + 0.20 * steer_blend
             steer_smooth = clamp(steer_smooth, -0.60, 0.60)
 
             car.read_write_std(throttle=throttle, steering=steer_smooth)
 
-            if debug and dbg is not None:
-                dbg_ui = draw_steer_overlay(dbg, steer_smooth, steer_max=0.42, title="STEER")
-                cv2.imshow("right_lane_edges_hough", dbg_ui)
-                cv2.imshow("camera", bgr)
-                try:
-                    # Map steering to arrow orientation: base west (left) then rotate by steering
-                    # Left turns should rotate arrow CCW, right turns CW.
+            # show debug steer overlay if available
+            try:
+                if debug and dbg is not None:
                     try:
-                        use_steering_for_arrow = True
-                        if use_steering_for_arrow:
-                            base_angle = math.pi + math.radians(-3.0)  # west + 3 degrees CW
-                            max_steer = getattr(follower, 'max_steer', 0.60)
-                            steer_scale = math.radians(60.0) / max_steer
-                            ui_heading = base_angle - float(steer_smooth) * steer_scale
-                        else:
-                            ui_heading = None
-                            if movement_heading is not None:
-                                ui_heading = movement_heading
-                            elif 'pose' in locals() and pose is not None:
-                                ui_heading = float(pose[2])
-                            if ui_heading is None:
-                                ui_heading = est_yaw
+                        cv2.putText(dbg, f"speed_cmd={v_cmd:.2f} m/s", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2)
+                        try:
+                            cv2.putText(dbg, f"steer_img={steer_cmd:+.3f} steer_pp={steer_pp if steer_pp is not None else 0.0:+.3f} beta={pp_beta_smooth:.2f}", (10, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,0), 2)
+                        except Exception:
+                            pass
                     except Exception:
-                        ui_heading = est_yaw
-                    bird = mapper.render(show_car=True, heading_override=ui_heading)
-                    cv2.imshow('lidar_birdeye', bird)
+                        pass
+                    dbg_ui = draw_steer_overlay(dbg, steer_smooth, steer_max=0.42, title="STEER")
+                    cv2.imshow("right_lane_edges_hough", dbg_ui)
+            except Exception:
+                pass
+
+            # Always show annotated camera view (overlay bbox/label if available)
+            try:
+                annotated = bgr.copy()
+                with sign_lock:
+                    last = sign_state.get('last_detection', None)
+                    last_line = sign_state.get('last_line', None)
+                # Only draw the bbox if the detection is recent to avoid stale overlays
+                draw_detection = False
+                if last is not None:
+                    try:
+                        if now() - float(last.get('t', 0.0)) <= DETECTION_RECENT_S:
+                            draw_detection = True
+                    except Exception:
+                        draw_detection = False
+
+                if draw_detection:
+                    lab = last.get('label', '')
+                    confv = last.get('conf', 0.0)
+                    bx1, by1, bx2, by2 = last.get('bbox')
+                    try:
+                        cv2.rectangle(annotated, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
+                        cv2.putText(annotated, f"{lab} {confv:.2f}", (bx1, max(12, by1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                    except Exception:
+                        pass
+                # show annotated camera view (only detection bbox/label)
+                try:
+                    cv2.imshow("camera", annotated)
+                except Exception:
+                    try:
+                        cv2.imshow("camera", bgr)
+                    except Exception:
+                        pass
+            except Exception:
+                try:
+                    cv2.imshow("camera", bgr)
                 except Exception:
                     pass
+
+            # Map steering to arrow orientation: base west (left) then rotate by steering
+            try:
+                use_steering_for_arrow = True
+                if use_steering_for_arrow:
+                    base_angle = math.pi + math.radians(-3.0)  # west + 3 degrees CW
+                    max_steer = getattr(follower, 'max_steer', 0.60)
+                    steer_scale = math.radians(60.0) / max_steer
+                    ui_heading = base_angle - float(steer_smooth) * steer_scale
+                else:
+                    ui_heading = None
+                    if movement_heading is not None:
+                        ui_heading = movement_heading
+                    elif 'pose' in locals() and pose is not None:
+                        ui_heading = float(pose[2])
+                    if ui_heading is None:
+                        ui_heading = est_yaw
+            except Exception:
+                ui_heading = est_yaw
+
+            try:
+                bird = mapper.render(show_car=True, heading_override=ui_heading)
+                # overlay waypoints + PurePursuit markers if available
+                try:
+                    overlay = bird.copy()
+                    if PURE_PURSUIT_ENABLED and pure_pursuit is not None and getattr(mapper, 'origin_world', None) is not None:
+                        ox, oy = mapper.origin_world
+                        ppm = float(mapper.px_per_m)
+                        mw = mapper.map_w_px
+                        mh = mapper.map_h_px
+                        # draw waypoint polyline
+                        try:
+                            wp = np.array(pure_pursuit.wp)
+                            if wp.ndim == 2 and wp.shape[0] == 2:
+                                pts_w = wp.T
+                            else:
+                                pts_w = wp.copy()
+                            pxs = []
+                            pys = []
+                            for (wx, wy) in pts_w:
+                                xpix = int(round((float(wx) - ox) * ppm))
+                                ypix = int(round((float(wy) - oy) * ppm))
+                                ypix_img = mh - 1 - ypix
+                                pxs.append(xpix)
+                                pys.append(ypix_img)
+                            # draw segments
+                            for i in range(1, len(pxs)):
+                                cv2.line(overlay, (pxs[i-1], pys[i-1]), (pxs[i], pys[i]), (255, 200, 0), 1)
+                            # draw waypoints
+                            for i, (xx, yy) in enumerate(zip(pxs, pys)):
+                                cv2.circle(overlay, (xx, yy), 3, (200, 120, 0), -1)
+                            # highlight current segment index
+                            try:
+                                idx = int(getattr(pure_pursuit, 'wpi', 0))
+                                if 0 <= idx < len(pxs):
+                                    cv2.circle(overlay, (pxs[idx], pys[idx]), 5, (0, 255, 255), -1)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
+                        # draw lookahead reference point
+                        try:
+                            p_ref = getattr(pure_pursuit, 'p_ref', None)
+                            if p_ref is not None:
+                                rx = int(round((float(p_ref[0]) - ox) * ppm))
+                                ry = int(round((float(p_ref[1]) - oy) * ppm))
+                                ry_img = mh - 1 - ry
+                                cv2.circle(overlay, (rx, ry_img), 6, (0, 0, 255), 2)
+                                # line from car to p_ref
+                                pose_local = getattr(mapper, 'last_pose', None)
+                                if pose_local is not None:
+                                    cx = int(round((pose_local[0] - ox) * ppm))
+                                    cy = int(round((pose_local[1] - oy) * ppm))
+                                    cy_img = mh - 1 - cy
+                                    cv2.line(overlay, (cx, cy_img), (rx, ry_img), (0, 0, 200), 1)
+                        except Exception:
+                            pass
+
+                        # draw lookahead circle radius
+                        try:
+                            la = float(getattr(pure_pursuit, 'lookahead', PURE_PURSUIT_LOOKAHEAD))
+                            # draw circle around car
+                            pose_local = getattr(mapper, 'last_pose', None)
+                            if pose_local is not None:
+                                cx = int(round((pose_local[0] - ox) * ppm))
+                                cy = int(round((pose_local[1] - oy) * ppm))
+                                cy_img = mh - 1 - cy
+                                rpx = max(2, int(round(la * ppm)))
+                                cv2.circle(overlay, (cx, cy_img), rpx, (0, 120, 255), 1)
+                        except Exception:
+                            pass
+
+                    # always show raw lidar birdseye
+                    cv2.imshow('lidar_birdeye', bird)
+                    # show waypoint overlay in separate window
+                    try:
+                        cv2.imshow('waypoint_map', overlay)
+                    except Exception:
+                        cv2.imshow('waypoint_map', bird)
+                except Exception:
+                    cv2.imshow('lidar_birdeye', bird)
+                    try:
+                        cv2.imshow('waypoint_map', bird)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # process GUI events / refresh windows
+            try:
                 cv2.waitKey(1)
+            except Exception:
+                pass
 
             # pacing
             sleep_dt = dt_nom - (now() - t)
@@ -1489,7 +2098,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--actor", type=int, default=0)
     ap.add_argument("--rate", type=float, default=30.0)
-    ap.add_argument("--speed", type=float, default=1.6)  # start slower while tuning
+    ap.add_argument("--speed", type=float, default=3.0)  # default speed (m/s)
     ap.add_argument("--no-debug", action="store_true")
     ap.add_argument("--sign-model", type=str, default=None, help="path to YOLO sign model (optional)")
     ap.add_argument("--sign-labels", type=str, default="sign_labels.txt", help="path to sign labels file")
