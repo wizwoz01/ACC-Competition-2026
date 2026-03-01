@@ -1,5 +1,4 @@
-# Scenario Runner (Pure Python Implementation)
-
+# Scenario Runner 
 The core autonomous pipeline replacing all Legacy MATLAB/Simulink workflows. This execution node encompasses the decision logic (State Machines), vehicle sensor acquisition (`pal`), motion control (`hal`), and visual perception (PyTorch + OpenCV).
 
 ## Included files
