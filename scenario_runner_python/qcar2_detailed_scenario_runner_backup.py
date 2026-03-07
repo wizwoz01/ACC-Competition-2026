@@ -19,6 +19,7 @@ import json
 import math
 import socket
 import struct
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
@@ -487,301 +488,272 @@ def sign_in_front_and_right(
 # ===================================================================
 
 class LaneController:
-    """Fit yellow/white boundaries and command lane-center steering.
+    """Canny + HoughLinesP lane detection (RightLaneFollower algorithm).
 
-    Sign convention: steer_raw positive = LEFT (internal).
+    Wider ROI trapezoid for curves; dropout tolerance; persistent bounds.
+    Return signature: (steer, ok, conf, err, dbg, xl, xr, y0)
     """
 
     def __init__(self):
-        self.kernel = np.ones((5, 5), np.uint8)
-        self.prev_err = 0.0
+        # --- ROI trapezoid (wider = sees further into curves) ---
+        self.roi_top_y_ratio = 0.35
+        self.roi_bottom_y_ratio = 1.00
+        self.roi_top_width_ratio = 0.55
+        self.roi_bottom_width_ratio = 1.02
+
+        # --- Hough params ---
+        self.hough_rho = 2
+        self.hough_theta = np.pi / 180
+        self.hough_thresh = 28
+        self.hough_min_line_len = 22
+        self.hough_max_line_gap = 40
+
         self.lane_width_px = 360.0
-        # Slight right bias = lane center (not road center); too high = hug right edge
-        self.bias_right_px = 20.0
-        self.k_lat = 0.65
+
+        # --- Control gains ---
+        self.k_lat = 1.00
         self.k_head = 0.25
-        self.kd = 0.02
-        self.max_steer = 0.34
+        self.kd = 0.04
+        self.max_steer = 0.60
+
+        self.prev_err = 0.0
         self.steer_smooth = 0.0
-        self.last_dbg = None
 
-    # --- helpers ---
+        # --- Dropout tolerance ---
+        self.last_good_time = 0.0
+        self.last_good_steer = 0.0
+
+        # --- Persisted boundaries ---
+        self.last_left = None
+        self.last_right = None
+        self.last_bound_time = 0.0
+        self.max_bound_age_s = 2.0
+        self.bias_right_px = 0.0
+        self.target_offset_frac = 0.20
+        self.last_center = None
+
+    def _roi_mask(self, H: int, W: int) -> np.ndarray:
+        y_top = int(self.roi_top_y_ratio * H)
+        y_bot = int(self.roi_bottom_y_ratio * H)
+        top_w = int(self.roi_top_width_ratio * W)
+        bot_w = int(self.roi_bottom_width_ratio * W)
+        x_mid = W // 2
+        pts = np.array([
+            [x_mid - bot_w // 2, y_bot],
+            [x_mid - top_w // 2, y_top],
+            [x_mid + top_w // 2, y_top],
+            [x_mid + bot_w // 2, y_bot],
+        ], dtype=np.int32)
+        mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts], 255)
+        return mask
 
     @staticmethod
-    def _strip_x(mask: np.ndarray, y1: int, y2: int, *, min_pix: int = 120) -> float | None:
-        y1 = int(np.clip(y1, 0, mask.shape[0] - 1))
-        y2 = int(np.clip(y2, 0, mask.shape[0]))
-        if y2 <= y1:
-            return None
-        win = mask[y1:y2, :]
-        xs = np.where(win > 0)[1]
-        if xs.size < min_pix:
-            return None
-        return float(np.percentile(xs.astype(np.float32, copy=False), 50))
+    def _fit_line_from_segments(segments):
+        if not segments:
+            return None, None, 0.0
+        xs, ys, wts = [], [], []
+        for (x1, y1, x2, y2) in segments:
+            L = math.hypot(x2 - x1, y2 - y1)
+            if L < 8:
+                continue
+            xs.extend([x1, x2]); ys.extend([y1, y2]); wts.extend([L, L])
+        if len(xs) < 4:
+            return None, None, 0.0
+        x = np.array(xs, dtype=np.float32)
+        y = np.array(ys, dtype=np.float32)
+        w = np.array(wts, dtype=np.float32)
+        W_mat = np.diag(w)
+        A = np.column_stack([x, np.ones_like(x)])
+        try:
+            sol = np.linalg.lstsq(W_mat @ A, W_mat @ y, rcond=None)[0]
+            return float(sol[0]), float(sol[1]), float(np.sum(w))
+        except Exception:
+            return None, None, 0.0
 
     @staticmethod
-    def _strip_x_range(mask: np.ndarray, y1: int, y2: int,
-                       x1: int, x2: int, *, min_pix: int = 120) -> float | None:
-        y1 = int(np.clip(y1, 0, mask.shape[0] - 1))
-        y2 = int(np.clip(y2, 0, mask.shape[0]))
-        x1 = int(np.clip(x1, 0, mask.shape[1] - 1))
-        x2 = int(np.clip(x2, 0, mask.shape[1]))
-        if (y2 <= y1) or (x2 <= x1):
-            return None
-        win = mask[y1:y2, x1:x2]
-        xs = np.where(win > 0)[1]
-        if xs.size < min_pix:
-            return None
-        xs = xs.astype(np.float32, copy=False) + float(x1)
-        return float(np.percentile(xs, 50))
-
-    @classmethod
-    def _boundary_pose(cls, mask: np.ndarray, roi_h: int
-                       ) -> Tuple[float | None, Tuple[float, float] | None]:
-        x_bot = cls._strip_x(mask, roi_h - 26, roi_h - 2)
-        x_mid = cls._strip_x(mask, roi_h - 92, roi_h - 64)
-        if x_bot is None:
-            return None, None
-        if x_mid is None:
-            return x_bot, None
-        vx = float(x_mid - x_bot)
-        vy = float((roi_h - 78) - (roi_h - 14))
-        if vy < 0.0:
-            vx, vy = -vx, -vy
-        if abs(vy) < 1e-3:
-            return x_bot, None
-        return x_bot, (vx, vy)
-
-    @classmethod
-    def _boundary_pose_range(cls, mask: np.ndarray, roi_h: int,
-                             x1: int, x2: int, *, min_pix: int = 120
-                             ) -> Tuple[float | None, Tuple[float, float] | None]:
-        x_bot = cls._strip_x_range(mask, roi_h - 26, roi_h - 2, x1, x2, min_pix=min_pix)
-        x_mid = cls._strip_x_range(mask, roi_h - 92, roi_h - 64, x1, x2, min_pix=min_pix)
-        if x_bot is None:
-            return None, None
-        if x_mid is None:
-            return x_bot, None
-        vx = float(x_mid - x_bot)
-        vy = float((roi_h - 78) - (roi_h - 14))
-        if vy < 0.0:
-            vx, vy = -vx, -vy
-        if abs(vy) < 1e-3:
-            return x_bot, None
-        return x_bot, (vx, vy)
-
-    # --- main step ---
+    def _x_at_y(m: float, b: float, y: float) -> float:
+        if m is None or b is None or abs(m) < 1e-6:
+            return float("nan")
+        return (y - b) / m
 
     def step(self, bgr: np.ndarray, dt: float, debug: bool = False):
+        """Canny+HoughLinesP lane detection. Returns (steer, ok, conf, err, dbg, xl, xr, y0)."""
+        t_now = time.time()
         if bgr is None or bgr.size == 0:
-            return 0.0, False, 0.0, 0.0, None, None, None, None
+            return 0.0, False, 0.0, 0.0, None, None, None, 0
 
-        if not np.isfinite(dt) or dt <= 0.0:
-            dt = 1.0 / 60.0
+        if not np.isfinite(dt) or dt <= 0:
+            dt = 1.0 / 30.0
 
         H, W = bgr.shape[:2]
-        y0 = int(0.62 * H)
-        roi = bgr[y0:H, :]
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mid_x = 0.5 * W
+        y0_roi = int(self.roi_top_y_ratio * H)
 
-        y_mask = cv2.inRange(hsv, (10, 70, 90), (45, 255, 255))
-        h, s, v = cv2.split(hsv)
-        w_mask = ((s < 70) & (v > 180)).astype(np.uint8) * 255
+        # CLAHE + adaptive Canny inside color mask
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_clahe = clahe.apply(gray)
 
-        y_mask = cv2.morphologyEx(y_mask, cv2.MORPH_OPEN, self.kernel)
-        y_mask = cv2.morphologyEx(y_mask, cv2.MORPH_CLOSE, self.kernel)
-        w_mask = cv2.morphologyEx(w_mask, cv2.MORPH_OPEN, self.kernel)
-        w_mask = cv2.morphologyEx(w_mask, cv2.MORPH_CLOSE, self.kernel)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        # Wider ranges: QLabs lane markings can be slightly dim (V~160) or warm-white
+        white_mask = cv2.inRange(hsv, np.array((0, 0, 150)), np.array((180, 85, 255)))
+        yellow_mask = cv2.inRange(hsv, np.array((8, 45, 80)), np.array((45, 255, 255)))
+        color_mask = cv2.bitwise_or(white_mask, yellow_mask)
+        km = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, km, iterations=1)
 
-        # Edge detection: Canny on grayscale, restricted to lane-colored regions
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 1.0)
-        canny = cv2.Canny(blur, 50, 150)
-        lane_region = cv2.dilate(cv2.bitwise_or(y_mask, w_mask), np.ones((5, 5), np.uint8))
-        edge_lane = cv2.bitwise_and(canny, lane_region)
-        if np.count_nonzero(edge_lane) < 200:
-            edge_lane = canny
+        blur = cv2.GaussianBlur(gray_clahe, (5, 5), 1.2)
+        try:
+            med = float(np.median(blur[color_mask > 0])) if np.count_nonzero(color_mask) else float(np.median(blur))
+        except Exception:
+            med = float(np.median(blur))
+        sigma = 0.50
+        low = int(max(8, (1.0 - sigma) * med))
+        high = int(min(255, (1.0 + sigma) * med))
+        if low >= high:
+            low = max(8, int(0.5 * high))
 
-        roi_h, roi_w = roi.shape[:2]
-        y_eval = float(roi_h - 6)
-        mid_x = int(0.5 * roi_w)
-        edge_xL, edge_vL = self._boundary_pose_range(edge_lane, roi_h, 0, mid_x, min_pix=45)
-        edge_xR, edge_vR = self._boundary_pose_range(edge_lane, roi_h, mid_x, roi_w, min_pix=45)
+        edges = cv2.Canny(blur, low, high)
+        edges = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=1)
 
-        # CRITICAL: Detect all THREE lines explicitly for better accuracy
-        # Line 1: Left boundary (yellow line on left side)
-        y_xL, y_vL = self._boundary_pose_range(y_mask, roi_h, 0, mid_x)
-        # Line 2: Right boundary (white line on right side)  
-        w_xR, w_vR = self._boundary_pose_range(w_mask, roi_h, mid_x, roi_w)
-        # Line 3: Center line (yellow line on right side OR white line on left side)
-        y_xR, y_vR = self._boundary_pose_range(y_mask, roi_h, mid_x, roi_w)
-        w_xL, w_vL = self._boundary_pose_range(w_mask, roi_h, 0, mid_x)
+        # Lower guard: only mask edges to color regions when the mask is meaningful
+        if int(np.count_nonzero(color_mask)) > 200:
+            km2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+            color_mask_d = cv2.dilate(color_mask, km2, iterations=2)  # wider dilation
+            edges = cv2.bitwise_and(edges, edges, mask=color_mask_d)
 
-        # Use left boundary (yellow left) and right boundary (white right) as primary
-        y_x, y_v = (y_xL, y_vL) if (y_xL is not None) else (y_xR, y_vR)
-        w_x, w_v = (w_xR, w_vR) if (w_xR is not None) else (w_xL, w_vL)
-        
-        # Determine center line from available detections
-        center_line_x = None
-        if y_xR is not None and w_xL is not None:
-            # Both center line candidates detected - use average for accuracy
-            center_line_x = 0.5 * (y_xR + w_xL)
-        elif y_xR is not None:
-            center_line_x = y_xR
-        elif w_xL is not None:
-            center_line_x = w_xL
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE,
+                                 cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), iterations=1)
 
-        if (y_x is None) or (w_x is None):
-            yg_x, yg_v = self._boundary_pose(y_mask, roi_h)
-            wg_x, wg_v = self._boundary_pose(w_mask, roi_h)
-            if y_x is None:
-                y_x, y_v = yg_x, yg_v
-            if w_x is None:
-                w_x, w_v = wg_x, wg_v
+        roi_mask = self._roi_mask(H, W)
+        edges_roi = cv2.bitwise_and(edges, edges, mask=roi_mask)
 
-        xl = xr = None
-        x_center = None
-        lane_mode = ""
+        lines = cv2.HoughLinesP(
+            edges_roi,
+            rho=self.hough_rho,
+            theta=self.hough_theta,
+            threshold=self.hough_thresh,
+            minLineLength=self.hough_min_line_len,
+            maxLineGap=self.hough_max_line_gap,
+        )
 
-        if (y_x is not None) and (w_x is not None):
-            yxf = float(y_x)
-            wxf = float(w_x)
-            w_est = float(abs(wxf - yxf))
-            
-            # CRITICAL: Use tighter width constraints and slower adaptation
-            if 170.0 < w_est < 900.0:
-                self.lane_width_px = 0.98 * self.lane_width_px + 0.02 * w_est  
-            
-            # CRITICAL: Use all three lines when available for maximum accuracy
-            if center_line_x is not None:
-                # Three lines detected - use center line to refine boundaries
-                center_xf = float(center_line_x)
-                if yxf <= center_xf <= wxf:
-                    # Center line is between left and right - use it to tighten boundaries
-                    lane_mode = "3L"  # Three lines detected
-                    xl = yxf
-                    xr = wxf
-                    # Use center line to refine center position - tighter calculation
-                    x_center = center_xf + float(self.bias_right_px)
-                elif yxf <= wxf:
-                    # Normal case - center line might be outside, use standard calculation
-                    lane_mode = "R"
-                    xl = yxf
-                    xr = wxf
-                    x_center = 0.5 * (xl + xr) + float(self.bias_right_px)
-                else:
-                    # Overlapping case
-                    lane_mode = "L->R"
-                    xl = yxf
-                    xr = xl + float(self.lane_width_px)
-                    x_center = float(xl + 0.5 * self.lane_width_px + self.bias_right_px)
-                    w_v = None
-            elif yxf <= wxf:
-                # Two lines detected - standard case
-                lane_mode = "R"
-                xl = yxf
-                xr = wxf
-                x_center = 0.5 * (xl + xr) + float(self.bias_right_px)
-            else:
-                lane_mode = "L->R"
-                xl = yxf
-                xr = xl + float(self.lane_width_px)
-                x_center = float(xl + 0.5 * self.lane_width_px + self.bias_right_px)
-                w_v = None
-        elif y_x is not None:
-            xl = float(y_x)
-            xr = float(xl + self.lane_width_px)
-            x_center = float(xl + 0.5 * self.lane_width_px + self.bias_right_px)
-        elif w_x is not None:
-            xr = float(w_x)
-            xl = float(xr - self.lane_width_px)
-            x_center = float(xr - 0.5 * self.lane_width_px + self.bias_right_px)
+        left_segs, right_segs = [], []
+        if lines is not None:
+            for (x1, y1, x2, y2) in lines[:, 0]:
+                dx = x2 - x1
+                dy = y2 - y1
+                if abs(dx) < 3:
+                    continue
+                m = dy / dx
+                if abs(m) < 0.30 or abs(m) > 6.0:
+                    continue
+                if m > 0 and max(x1, x2) > int(0.52 * W):
+                    right_segs.append((x1, y1, x2, y2))
+                elif m < 0 and min(x1, x2) < int(0.48 * W):
+                    left_segs.append((x1, y1, x2, y2))
 
-        # Fuse color boundaries with edge detection for robustness (shadows, worn paint)
-        if edge_xL is not None:
-            xl = (0.55 * xl + 0.45 * edge_xL) if xl is not None else float(edge_xL)
-        if edge_xR is not None:
-            xr = (0.55 * xr + 0.45 * edge_xR) if xr is not None else float(edge_xR)
-        if xl is not None and xr is not None and np.isfinite(xl) and np.isfinite(xr):
-            x_center = float(0.5 * (xl + xr) + self.bias_right_px)
+        mL, bL, wL = self._fit_line_from_segments(left_segs)
+        mR, bR, wR = self._fit_line_from_segments(right_segs)
 
-        if x_center is None or not np.isfinite(x_center):
+        y_bottom = float(H - 1)
+        xL_bottom = self._x_at_y(mL, bL, y_bottom) if mL is not None else float("nan")
+        xR_bottom = self._x_at_y(mR, bR, y_bottom) if mR is not None else float("nan")
+
+        have_L = bool(np.isfinite(xL_bottom) and 0 <= xL_bottom <= W)
+        have_R = bool(np.isfinite(xR_bottom) and 0 <= xR_bottom <= W)
+
+        recent_ok = (t_now - self.last_bound_time) < self.max_bound_age_s
+        xL_use = xL_bottom if have_L else (self.last_left if (self.last_left is not None and recent_ok) else float("nan"))
+        xR_use = xR_bottom if have_R else (self.last_right if (self.last_right is not None and recent_ok) else float("nan"))
+        have_xL = bool(np.isfinite(xL_use))
+        have_xR = bool(np.isfinite(xR_use))
+
+        if have_xL and have_xR and (xR_use > xL_use + 40):
+            w_est = float(xR_use - xL_use)
+            if 180.0 < w_est < 900.0:
+                self.lane_width_px = 0.95 * self.lane_width_px + 0.05 * w_est
+            offset_px = self.bias_right_px if abs(self.bias_right_px) > 1e-6 else (self.target_offset_frac * w_est)
+            x_center = 0.5 * (xL_use + xR_use) + offset_px
+            mode = "LR"
+            conf = clamp((wL + wR) / 900.0, 0.0, 1.0)
+            angL = math.atan(mL) if mL is not None else 0.0
+            angR = math.atan(mR) if mR is not None else 0.0
+            ang = 0.5 * (angL + angR)
+        elif have_xR:
+            bias_term = self.bias_right_px if self.bias_right_px > 0.0 else (self.target_offset_frac * self.lane_width_px)
+            x_center = xR_use - 0.5 * self.lane_width_px + bias_term
+            mode = "R"
+            conf = clamp(wR / 650.0, 0.0, 1.0)
+            ang = math.atan(mR) if mR is not None else math.radians(70.0)
+        elif have_xL:
+            bias_term = self.bias_right_px if self.bias_right_px > 0.0 else (self.target_offset_frac * self.lane_width_px)
+            x_center = xL_use + 0.5 * self.lane_width_px + bias_term
+            mode = "L"
+            conf = clamp(wL / 650.0, 0.0, 1.0)
+            ang = math.atan(mL) if mL is not None else math.radians(110.0)
+        else:
+            dbg = None
             if debug:
-                self.last_dbg = roi
-            return 0.0, False, 0.0, 0.0, (roi if debug else None), None, None, y0
+                dbg = cv2.cvtColor(edges_roi, cv2.COLOR_GRAY2BGR)
+                cv2.putText(dbg, "LANE: LOST", (10, 35),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            return (float(self.last_good_steer), False, 0.0, float(self.prev_err),
+                    dbg, self.last_left, self.last_right, y0_roi)
 
-        x_center = float(np.clip(x_center, 0.0, roi_w - 1.0))
-        
-        # This prevents the detected lane from extending onto sidewalks
-        tight_lane_width = 0.98 * self.lane_width_px  # 8% tighter for safety
-        
-        xl_use = float(np.clip(xl if xl is not None else (x_center - 0.5 * tight_lane_width), 0.0, roi_w - 1.0))
-        xr_use = float(np.clip(xr if xr is not None else (x_center + 0.5 * tight_lane_width), 0.0, roi_w - 1.0))
-        if xl_use > xr_use:
-            xl_use, xr_use = xr_use, xl_use
-
-        mid = 0.5 * roi_w
-        err = float((mid - x_center) / max(1.0, mid))
+        x_center = float(np.clip(x_center, 0.0, W - 1.0))
+        err = float((mid_x - x_center) / max(1.0, mid_x))
         derr = float((err - self.prev_err) / max(1e-3, dt))
         self.prev_err = err
 
-        v_list = []
-        if y_v is not None:
-            v_list.append(y_v)
-        if w_v is not None:
-            v_list.append(w_v)
-        if v_list:
-            vx = float(sum(v[0] for v in v_list) / len(v_list))
-            vy = float(sum(v[1] for v in v_list) / len(v_list))
-            ang = math.atan2(vy, vx)
-            head_err = wrap_pi((math.pi / 2.0) - ang)
-        else:
-            head_err = 0.0
+        nominal = math.radians(85.0)
+        head_err = clamp((nominal - ang), -0.9, 0.9)
 
-        steer = (self.k_lat * err) + (self.k_head * head_err) + (self.kd * derr)
+        steer = self.k_lat * err + self.k_head * head_err + self.kd * derr
         steer = clamp(steer, -self.max_steer, self.max_steer)
-        # Low-pass to reduce oscillation from vision noise
-        self.steer_smooth = 0.72 * self.steer_smooth + 0.28 * steer
+        self.steer_smooth = 0.78 * self.steer_smooth + 0.22 * steer
         steer = self.steer_smooth
 
-        y_nf = y_mask[max(0, roi_h - 120):roi_h, :]
-        w_nf = w_mask[max(0, roi_h - 120):roi_h, :]
-        lane_pix = float((y_nf > 0).mean() + (w_nf > 0).mean())
-        conf = clamp(lane_pix / 0.07, 0.0, 1.0)
-        valid = bool(conf > 0.25)
+        lane_ok = bool(conf > 0.18)
+        if lane_ok:
+            self.last_good_time = t_now
+            self.last_good_steer = steer
+            if have_L:
+                self.last_left = float(xL_bottom)
+            if have_R:
+                self.last_right = float(xR_bottom)
+            self.last_bound_time = t_now
+        try:
+            self.last_center = float(x_center)
+        except Exception:
+            pass
+
+        xl_ret = float(xL_use) if have_xL else (self.last_left if self.last_left is not None else None)
+        xr_ret = float(xR_use) if have_xR else (self.last_right if self.last_right is not None else None)
 
         dbg = None
         if debug:
-            dbg = roi.copy()
-            edge_overlay = cv2.cvtColor(edge_lane, cv2.COLOR_GRAY2BGR)
-            edge_overlay[edge_lane > 0] = (0, 255, 0)
-            cv2.addWeighted(edge_overlay, 0.35, dbg, 1.0, 0, dbg)
-            cv2.circle(dbg, (int(x_center), int(y_eval)), 7, (0, 0, 255), -1)
-            # Draw left boundary (yellow line)
-            if xl is not None:
-                cv2.line(dbg, (int(xl), 0), (int(xl), roi_h - 1), (0, 255, 255), 2)
-            # Draw right boundary (white line)
-            if xr is not None:
-                cv2.line(dbg, (int(xr), 0), (int(xr), roi_h - 1), (255, 255, 255), 2)
-            # Draw center line if detected (green dashed line)
-            if center_line_x is not None:
-                center_x_int = int(center_line_x)
-                for y in range(0, roi_h, 20):  # Dashed line
-                    cv2.line(dbg, (center_x_int, y), (center_x_int, min(y + 10, roi_h - 1)), (0, 255, 0), 2)
-            if lane_mode:
-                mode_text = f"mode={lane_mode}"
-                if center_line_x is not None:
-                    mode_text += " (3L)"  # Indicate three lines detected
-                cv2.putText(dbg, mode_text, (10, 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                cv2.putText(dbg, f"conf={conf:.2f} err={err:+.2f} head={head_err:+.2f}",
-                            (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            else:
-                cv2.putText(dbg, f"conf={conf:.2f} err={err:+.2f} head={head_err:+.2f}",
-                            (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        self.last_dbg = dbg
+            dbg = cv2.cvtColor(edges_roi, cv2.COLOR_GRAY2BGR)
 
-        return float(steer), bool(valid), float(conf), float(err), dbg, float(xl_use), float(xr_use), int(y0)
+            def _draw_line(m_v, b_v, color):
+                if m_v is None or b_v is None:
+                    return
+                y1b = int(0.35 * H)
+                y2b = H - 1
+                x1b = int(self._x_at_y(m_v, b_v, y1b))
+                x2b = int(self._x_at_y(m_v, b_v, y2b))
+                if 0 <= x1b < W and 0 <= x2b < W:
+                    cv2.line(dbg, (x1b, y1b), (x2b, y2b), color, 3)
+
+            _draw_line(mL, bL, (255, 80, 0))   # left = orange
+            _draw_line(mR, bR, (0, 255, 80))   # right = green
+            cv2.circle(dbg, (int(x_center), H - 6), 7, (0, 0, 255), -1)
+            cv2.putText(dbg, f"conf={conf:.2f} err={err:+.2f} head={math.degrees(head_err):+.1f}",
+                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+            cv2.putText(dbg, f"mode={mode} steer={steer:+.2f}",
+                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+        return float(steer), bool(lane_ok), float(conf), float(err), dbg, xl_ret, xr_ret, y0_roi
 
 # ===================================================================
 #  Sidewalk / Curb Guard
@@ -798,7 +770,10 @@ class SidewalkGuard:
             return 0.0, 0.0, 0.0, None
 
         H, W = bgr.shape[:2]
-        y0 = int(lane_y0) if (lane_y0 is not None) else int(0.72 * H)
+        # Never start the sidewalk ROI above 60% down the image – the lane-detection
+        # top boundary (0.35*H) would pull in the bright QLabs background tiles.
+        _y0_raw = int(lane_y0) if (lane_y0 is not None) else int(0.72 * H)
+        y0 = max(_y0_raw, int(0.60 * H))
         roi = bgr[y0:H, :]
         rH, rW = roi.shape[:2]
 
@@ -824,13 +799,13 @@ class SidewalkGuard:
         # the older thresholds were overly permissive and frequently classified asphalt as "sidewalk".
         # Tighten the LAB/HSV thresholds so only truly over-bright, low-saturation regions trigger.
         sw_rel = (
-            (L > (L_med + 75.0))
-            & (s < min(35.0, s_med + 8.0))
-            & (v > (v_med + 55.0))
+            (L > (L_med + 88.0))           # was 75 – need more contrast vs asphalt
+            & (s < min(28.0, s_med + 6.0)) # was 35/8 – tighter saturation gate
+            & (v > (v_med + 65.0))         # was 55 – brighter foreground needed
         )
-        sw_abs = (L > 240.0) & (s < 35.0) & (v > 230.0)
+        sw_abs = (L > 245.0) & (s < 28.0) & (v > 238.0)  # was 240/35/230
         sw = (sw_rel | sw_abs).astype(np.uint8) * 255
-        sw = cv2.morphologyEx(sw, cv2.MORPH_OPEN, self.kernel, iterations=1)
+        sw = cv2.morphologyEx(sw, cv2.MORPH_OPEN, self.kernel, iterations=2)  # was 1
         sw = cv2.morphologyEx(sw, cv2.MORPH_CLOSE, self.kernel, iterations=2)
 
         sw_bin = (sw > 0).astype(np.float32)
@@ -1087,6 +1062,106 @@ def render_waypoint_map(
     return img
 
 # ===================================================================
+#  LiDAR occupancy mapper
+# ===================================================================
+
+def _polar_to_xy_car(angles: np.ndarray, distances: np.ndarray) -> np.ndarray:
+    """Convert QCarLidar angles/distances to car-frame XY (x=forward, y=left)."""
+    if angles is None or distances is None:
+        return np.empty((0, 2), dtype=np.float32)
+    a = (-angles + np.pi).astype(np.float32)
+    a = (a + np.pi) % (2.0 * np.pi) - np.pi
+    d = distances.astype(np.float32, copy=False)
+    valid = np.isfinite(d) & (d > 0.01) & (d <= 8.0)
+    if not np.any(valid):
+        return np.empty((0, 2), dtype=np.float32)
+    a = a[valid]; d = d[valid]
+    return np.column_stack([d * np.cos(a), d * np.sin(a)]).astype(np.float32)
+
+
+class LidarMapper:
+    """World-frame occupancy grid with birdseye renderer."""
+
+    def __init__(self, map_size_m=(12.0, 12.0), px_per_m: float = 50.0):
+        self.map_size_m = (float(map_size_m[0]), float(map_size_m[1]))
+        self.px_per_m   = float(px_per_m)
+        self.map_w_px   = max(16, int(self.map_size_m[0] * self.px_per_m))
+        self.map_h_px   = max(16, int(self.map_size_m[1] * self.px_per_m))
+        self._occupancy = np.zeros((self.map_h_px, self.map_w_px), dtype=np.float32)
+        self._lock      = threading.Lock()
+        self.origin_world = None
+        self.last_pose    = None
+        self._last_raw    = None
+
+    def _ensure_origin(self, px: float, py: float):
+        if self.origin_world is None:
+            self.origin_world = (px - 0.5 * self.map_size_m[0],
+                                 py - 0.5 * self.map_size_m[1])
+
+    def accumulate(self, pts_xy: np.ndarray, pose):
+        if pts_xy is None or pts_xy.size == 0:
+            return
+        self._last_raw = pts_xy.copy()
+        if pose is None and self.last_pose is None:
+            return
+        with self._lock:
+            if pose is not None:
+                self.last_pose = pose
+            lp = self.last_pose
+            if lp is None:
+                return
+            self._ensure_origin(lp[0], lp[1])
+            th = float(lp[2])
+            c, s = math.cos(th), math.sin(th)
+            R = np.array([[c, -s], [s, c]], dtype=np.float32)
+            pts_w = (R @ pts_xy.T).T + np.array([lp[0], lp[1]], dtype=np.float32)
+            ox, oy = self.origin_world
+            px_i = np.floor((pts_w[:, 0] - ox) * self.px_per_m).astype(np.int32)
+            py_i = self.map_h_px - 1 - np.floor(
+                (pts_w[:, 1] - oy) * self.px_per_m).astype(np.int32)
+            ok = ((px_i >= 0) & (px_i < self.map_w_px) &
+                  (py_i >= 0) & (py_i < self.map_h_px))
+            for xi, yi in zip(px_i[ok], py_i[ok]):
+                self._occupancy[yi, xi] = min(255.0, self._occupancy[yi, xi] + 1.0)
+
+    def render(self) -> np.ndarray:
+        with self._lock:
+            occ    = self._occupancy.copy()
+            origin = self.origin_world
+            pose   = self.last_pose
+            raw    = None if self._last_raw is None else self._last_raw.copy()
+
+        if origin is not None and pose is not None and occ.max() > 0:
+            norm = np.clip((occ / occ.max()) * 255.0, 0, 255).astype(np.uint8)
+            img  = cv2.applyColorMap(norm, cv2.COLORMAP_HOT)
+            ox, oy = origin
+            cx = int((pose[0] - ox) * self.px_per_m)
+            cy = self.map_h_px - 1 - int((pose[1] - oy) * self.px_per_m)
+            if 0 <= cx < self.map_w_px and 0 <= cy < self.map_h_px:
+                th = float(pose[2])
+                fwd_x = int(round(cx + math.cos(th) * self.px_per_m * 0.4))
+                fwd_y = int(round(cy - math.sin(th) * self.px_per_m * 0.4))
+                cv2.arrowedLine(img, (cx, cy), (fwd_x, fwd_y),
+                                (0, 255, 0), 2, tipLength=0.35)
+                cv2.circle(img, (cx, cy),
+                           max(3, int(self.px_per_m * 0.08)), (0, 220, 0), -1)
+            return img
+
+        # Fallback: car-frame scan on black canvas
+        img2 = np.zeros((self.map_h_px, self.map_w_px, 3), dtype=np.uint8)
+        cx, cy = self.map_w_px // 2, self.map_h_px // 2
+        if raw is not None:
+            for px_m, py_m in raw:
+                pxi = int(round(cx + float(px_m) * self.px_per_m))
+                pyi = int(round(cy - float(py_m) * self.px_per_m))
+                if 0 <= pxi < self.map_w_px and 0 <= pyi < self.map_h_px:
+                    img2[max(0, pyi-1):pyi+2, max(0, pxi-1):pxi+2] = (200, 200, 200)
+        cv2.circle(img2, (cx, cy),
+                   max(3, int(self.px_per_m * 0.08)), (0, 220, 0), -1)
+        return img2
+
+
+# ===================================================================
 #  Main Runner
 # ===================================================================
 
@@ -1096,7 +1171,7 @@ def run_scenario(
     sample_rate_hz: float = 30.0,
     # Increased default max speed to help complete route faster while
     # preserving existing safety caps elsewhere in the controller.
-    max_speed_mps: float = 6.0,
+    max_speed_mps: float = 0.6,
     debug_print: bool = True,
     use_lidar: bool = True,
     use_realsense: bool = True,
@@ -1107,8 +1182,6 @@ def run_scenario(
     sign_device: str = "cuda",
 ):
     STEER_OUTPUT_SIGN = 1.0
-    WAYPOINT_SCALE_M  = 0.10   # waypoints.txt is in x10 scale
-    WORLD_SCALE       = 0.10   # QLabs world coords are x10 simulation scale
 
     # ------------------------------------------------------------------
     # Load & prepare waypoints
@@ -1118,17 +1191,35 @@ def run_scenario(
         if r not in paths:
             raise RuntimeError(f"Missing required path '{r}' in {waypoints_file}")
 
+    raw_max_abs = max(
+        float(np.max(np.abs(np.asarray(paths[r], dtype=np.float64))))
+        for r in ("path_to_pickup", "path_to_dropoff", "path_to_hub")
+    )
+    waypoint_scale_m = 0.10 if raw_max_abs > 8.0 else 1.0
+    world_scale = waypoint_scale_m
+    compact_track = raw_max_abs <= 8.0
+
+    def pure_pursuit_lookahead_m(segment_name: str) -> float:
+        if segment_name == "PARK":
+            return 0.22 if compact_track else 0.35
+        if segment_name == "TO_HUB":
+            return 0.28 if compact_track else 0.60
+        return 0.35 if compact_track else 0.80
+
     P_pick = interpolate_waypoints(paths["path_to_pickup"],  spacing=0.5)
     P_drop = interpolate_waypoints(paths["path_to_dropoff"], spacing=0.5)
     P_hub  = interpolate_waypoints(paths["path_to_hub"],     spacing=0.5)
 
     route_segments: list[tuple[str, np.ndarray]] = [
-        ("TO_PICKUP",  np.array(P_pick, dtype=np.float64) * WAYPOINT_SCALE_M),
-        ("TO_DROPOFF", np.array(P_drop, dtype=np.float64) * WAYPOINT_SCALE_M),
-        ("TO_HUB",     np.array(P_hub,  dtype=np.float64) * WAYPOINT_SCALE_M),
+        ("TO_PICKUP",  np.array(P_pick, dtype=np.float64) * waypoint_scale_m),
+        ("TO_DROPOFF", np.array(P_drop, dtype=np.float64) * waypoint_scale_m),
+        ("TO_HUB",     np.array(P_hub,  dtype=np.float64) * waypoint_scale_m),
     ]
 
     if debug_print:
+        scale_mode = "x10->meters" if waypoint_scale_m < 1.0 else "meters"
+        print(f"[WP] waypoint scale mode: {scale_mode} (factor={waypoint_scale_m:.2f}, raw_max_abs={raw_max_abs:.3f})")
+        print(f"[LOC] world scale factor: {world_scale:.2f}")
         for name, wp in route_segments:
             print(f"[WP] {name}: {wp.shape[0]} pts")
 
@@ -1142,6 +1233,10 @@ def run_scenario(
     # Devices
     # ------------------------------------------------------------------
     car = QCar(readMode=1, frequency=int(sample_rate_hz))
+    
+    # Initialize headlights to OFF immediately
+    car.read_write_std(throttle=0.0, steering=0.0, LEDs=np.array([0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float64))
+
     cam = Camera2D(cameraId="3@tcpip://localhost:18964",
                    frameWidth=820, frameHeight=410,
                    frameRate=sample_rate_hz)
@@ -1168,6 +1263,9 @@ def run_scenario(
 
     lidar_warn_t = 0.0
 
+    # LiDAR occupancy map (world-frame, 12 m × 12 m at 50 px/m = 600×600 px)
+    _lidar_mapper = LidarMapper(map_size_m=(12.0, 12.0), px_per_m=50.0)
+
     # ------------------------------------------------------------------
     # Sign model (YOLO26 / Ultralytics) – traffic-light colour detection
     # Pass --sign-model path to a yolo26*.pt or trained best.pt
@@ -1193,13 +1291,13 @@ def run_scenario(
     # brief full stop. Adjust if more stopping time is required for safety.
     STOP_SIGN_DWELL_S   = 0.8
     YIELD_SLOW_S        = 2.0
-    YIELD_SPEED         = 1.4
+    YIELD_SPEED         = 0.14
     TL_HOLD_S           = 4.0
-    TL_YELLOW_SPEED     = 1.4
-    # Increased cruise speed to reduce slow caps on gentle curves and routine
-    # slowdowns; preserves hard-stop logic elsewhere.
-    MIN_CRUISE_SPEED    = 5.2
-
+    TL_YELLOW_SPEED     = 0.14
+    # Cruise speed cap used for curves and goal approach.
+    # On the compact 1/10-scale track keep this well below max_speed_mps.
+    # MIN_CRUISE_SPEED    = 0.10 if compact_track else 0.52
+    MIN_CRUISE_SPEED    = 0.08 
     stop_sign_active    = False
     stop_sign_stopped_t = 0.0
     yield_slow_until    = 0.0
@@ -1255,7 +1353,7 @@ def run_scenario(
     PARK_GOAL_XYTH: tuple[float, float, float] | None = None
     PARK_FORWARD_M = 1.20
     PARK_LATERAL_M = 0.00
-    PARK_SPEED_MPS = 0.35
+    PARK_SPEED_MPS = 0.035
     PARK_LOOKAHEAD_M = 0.35
     PARK_STOP_RADIUS_M = 0.18
     PARK_STOP_YAW_DEG = 25.0
@@ -1274,9 +1372,17 @@ def run_scenario(
     SEG_GOAL_RADIUS_M     = 0.60
     SEG_GOAL_RADIUS_TAIL_M = 1.2   # When at last waypoints, "close enough" to complete segment
     SEG_TAIL_WP_COUNT  = 8
+    segment_started_t = now()
 
-    pure_pursuit = PurePursuitController(waypoints=active_wp.T, lookahead=0.8, cyclic=False)
+    pure_pursuit = PurePursuitController(
+        waypoints=active_wp.T,
+        lookahead=pure_pursuit_lookahead_m(active_name),
+        cyclic=False,
+    )
     pure_pursuit.maxSteeringAngle = 0.42
+    last_path_cte_m = 0.0
+    if debug_print:
+        print(f"[NAV] Pure Pursuit lookahead {active_name}={pure_pursuit.lookahead:.2f}m")
 
     # Track the last waypoint index we explicitly set and provide a safe setter
     # to prevent resyncs that jump backwards or wildly during the TO_HUB segment.
@@ -1350,8 +1456,8 @@ def run_scenario(
     CENTER_SLOW_M      = 1.00
     SIDE_HARD_STOP_M   = 0.30
     SIDE_BYPASS_CLEAR_M = 1.50
-    HIGH_STEER_SPEED_CAP = 2.0    # Cap when steering is really high
-    MOD_STEER_SPEED_CAP  = 2.0    # Moderate steer
+    HIGH_STEER_SPEED_CAP = 0.2    # Cap when steering is really high
+    MOD_STEER_SPEED_CAP  = 0.2    # Moderate steer
     OBSTACLE_STOP_CONFIRM_S = 0.22
 
     # Reverse recovery (unstick when wedged against curb/wall)
@@ -1359,24 +1465,24 @@ def run_scenario(
     RECOVER_ENABLE          = bool(recover_enable)
     RECOVER_STUCK_CONFIRM_S = 0.80
     RECOVER_REVERSE_S       = 1.10
-    RECOVER_REVERSE_SPEED   = 0.75
+    RECOVER_REVERSE_SPEED   = 0.075
     RECOVER_FORWARD_S       = 0.55
-    RECOVER_FORWARD_SPEED   = 0.45
+    RECOVER_FORWARD_SPEED   = 0.045
     RECOVER_COOLDOWN_S      = 2.50
 
-    LANE_LOST_SLOW_SPEED    = 0.32
+    LANE_LOST_SLOW_SPEED    = 0.032
     LANE_LOST_STOP_S        = 1.20
     LANE_DEPART_ERR_SLOW    = 0.45
     LANE_DEPART_ERR_STOP    = 0.70
     LANE_DEPART_STEER_MAX   = 0.38
     LANE_DEPART_ERR_LANE_ONLY = 0.90
-    LANE_DEPART_RECOVER_SPEED = 0.38
+    LANE_DEPART_RECOVER_SPEED = 0.038
     LANE_DEPART_RECOVER_CLEAR_M = 1.20
     LANE_DEPART_STOP_GRACE_S = 0.75
     WRONG_SIDE_LANE_ERR = 0.36   # |lane_err| above this and car left of lane = wrong side (lane_err < 0)
     WRONG_SIDE_FORCE_RIGHT_S = 2.5  # How long to keep forcing right after wrong-side detected
     WRONG_SIDE_STEER_RIGHT = -0.43  # Steer hard right to get back (negative = right)
-    WRONG_SIDE_SPEED = 1.60        # Speed while correcting (fast enough to rejoin, not crawl)
+    WRONG_SIDE_SPEED = 0.160        # Speed while correcting (fast enough to rejoin, not crawl)
 
     # EXTREME sidewalk guard – never broken by any other logic.
     # SidewalkGuard returns MEANS of a binary mask (0..1). Tune thresholds accordingly.
@@ -1387,7 +1493,7 @@ def run_scenario(
     SW_NEAR_STOP = 0.18   # Near-sidewalk: slightly more sensitive than SW_STOP
     SW_STRONG_CONFIRM_S = 0.15  # Confirm quickly, but avoid spikes
     SW_PROBE_CLEAR_M = 1.10
-    SW_PROBE_SPEED   = 0.12
+    SW_PROBE_SPEED   = 0.012
     SW_EXTREME_THRESHOLD = 0.18  # Final guard: very strong signal forces steer away + slow (unbreakable)
 
     # ------------------------------------------------------------------
@@ -1424,8 +1530,22 @@ def run_scenario(
     wrong_way_print_until = 0.0
     wrong_way_force_right_until = 0.0   # When wrong-way near RB: force keep-right until this time
     last_wrong_way_resync_t = -999.0    # Last time we resynced for wrong-way (cooldown)
+    last_generic_wrong_way_resync_t = -999.0
     severe_wrong_way_active = False     # True when heading is severely wrong (~115 deg+); relax sidewalk full-stop to allow creep
     i_near = 0   # Nearest waypoint index (for HUD / waypoint map; updated in segment block)
+
+    GENERIC_WRONG_WAY_THRESHOLD = math.radians(105.0 if compact_track else 90.0)
+    GENERIC_WRONG_WAY_CTE_M = 0.45 if compact_track else 0.60
+    GENERIC_WRONG_WAY_RESYNC_COOLDOWN_S = 1.0 if compact_track else 0.5
+    GENERIC_WRONG_WAY_START_GRACE_S = 1.0 if compact_track else 0.5
+    HIGH_CTE_M = 0.60 if compact_track else 0.75
+    MID_CTE_M = 0.40
+    LOW_CTE_M = 0.25 if compact_track else 0.30
+    HIGH_CTE_SPEED_CAP = min(float(max_speed_mps), 0.12 if compact_track else 0.62)
+    MID_CTE_SPEED_CAP = min(float(max_speed_mps), 0.18 if compact_track else MIN_CRUISE_SPEED)
+    LOW_CTE_SPEED_CAP = min(float(max_speed_mps), 0.22 if compact_track else MIN_CRUISE_SPEED)
+    START_HUB_SIDEWALK_SUPPRESS_S = 4.0 if compact_track else 0.0
+    START_HUB_SIDEWALK_RADIUS_M = 0.55 if compact_track else 0.0
 
     # IO timeout / backoff
     last_bgr     = None
@@ -1541,9 +1661,16 @@ def run_scenario(
             # ----------------------------------------------------------
             wt_ok, wt_loc, wt_rot, _ = _car_qlabs.get_world_transform()
             if wt_ok:
-                pose_x  = float(wt_loc[0]) * WORLD_SCALE
-                pose_y  = float(wt_loc[1]) * WORLD_SCALE
+                pose_x  = float(wt_loc[0]) * world_scale
+                pose_y  = float(wt_loc[1]) * world_scale
                 pose_th = float(wt_rot[2])                   # yaw in radians
+
+            # Feed LiDAR occupancy mapper (uses fresh pose from this frame)
+            if lidar_angles is not None and lidar_dist is not None:
+                _lidar_mapper.accumulate(
+                    _polar_to_xy_car(lidar_angles, lidar_dist),
+                    (pose_x, pose_y, pose_th) if wt_ok else None,
+                )
 
             # Tachometer speed (for Stanley denominator / HUD)
             v_est = float(getattr(car, "motorTach", 0.0))
@@ -1564,7 +1691,9 @@ def run_scenario(
                 # CRITICAL: Proactive wrong-way check near roundabouts.
                 # When heading left of path: force keep-right STEER (don’t just resync every frame).
                 # Resync at most once per cooldown to avoid resync loop.
-                for rb_sign in MAP_ROUNDABOUT_SIGNS:
+                # Skip on TO_DROPOFF: car is EXITING the roundabout; heading away from RB is correct.
+                _rb_check = [] if active_name == "TO_DROPOFF" else MAP_ROUNDABOUT_SIGNS
+                for rb_sign in _rb_check:
                     dist_to_rb = math.hypot(pose_x - rb_sign.x, pose_y - rb_sign.y)
                     if 0.8 < dist_to_rb < 10.0:
                         look_ahead_idx = min(i_near + 8, active_wp.shape[0] - 1)
@@ -1694,6 +1823,9 @@ def run_scenario(
                     else:
                         active_name, active_wp = route_segments[segment_idx]
                         seg_max_idx = 0
+                        segment_started_t = t
+                        last_path_cte_m = 0.0
+                        last_set_wp_index = 0
                         # Special handling for return-to-hub: densify waypoints and
                         # use a shorter lookahead + softer steering for higher accuracy.
                         if active_name == "TO_HUB":
@@ -1701,14 +1833,20 @@ def run_scenario(
                                 active_wp = interpolate_waypoints(active_wp, spacing=0.50)
                             except Exception:
                                 pass
-                            pure_pursuit = PurePursuitController(waypoints=active_wp.T, lookahead=0.60, cyclic=False)
+                            pure_pursuit = PurePursuitController(
+                                waypoints=active_wp.T,
+                                lookahead=pure_pursuit_lookahead_m(active_name),
+                                cyclic=False,
+                            )
                             pure_pursuit.maxSteeringAngle = 0.38
                         else:
                             pure_pursuit.updatePath(active_wp.T, cyclic=False)
+                            pure_pursuit.lookahead = pure_pursuit_lookahead_m(active_name)
+                            pure_pursuit.set_waypoint_index(0)
                             pure_pursuit.maxSteeringAngle = 0.42
                         segment_hold_until = t + SEGMENT_HOLD_S
                         if debug_print:
-                            print(f"[NAV] Segment switch -> {active_name}")
+                            print(f"[NAV] Segment switch -> {active_name} lookahead={pure_pursuit.lookahead:.2f}m")
 
             # ----------------------------------------------------------
             # 4. Stanley steering
@@ -1751,9 +1889,18 @@ def run_scenario(
             else:
                 step_name = active_name
                 v_ctrl = max(0.20, dr_speed)
+                base_lookahead_m = pure_pursuit_lookahead_m(active_name)
+                if last_path_cte_m > MID_CTE_M:
+                    pure_pursuit.lookahead = max(0.18 if compact_track else 0.35, 0.70 * base_lookahead_m)
+                else:
+                    pure_pursuit.lookahead = base_lookahead_m
                 target_steer = float(pure_pursuit.update(
                     np.array([pose_x, pose_y], dtype=np.float64), pose_th, v_ctrl))
                 target_steer = clamp(target_steer, -0.42, 0.42)
+
+                cte = float(np.linalg.norm(
+                    np.array([pose_x, pose_y]) - np.array(pure_pursuit.p_ref)))
+                last_path_cte_m = cte
 
                 # Wrong-way detection: only resync if heading is truly backwards (>90°)
                 # Trust Stanley path following - waypoints are correct!
@@ -1762,20 +1909,33 @@ def run_scenario(
                 
                 # Only resync if heading is significantly wrong (>90° = truly backwards).
                 # Skip at segment end: no waypoints ahead, so resync to i_near is useless and causes a loop.
-                wrong_way_threshold = 1.57  # 90° - only resync if truly backwards
+                # Skip on TO_DROPOFF: the car just exited the roundabout; any heading error is from the
+                # exit angle, not genuine wrong-way travel. Resyncing here drags the car into the top wall.
                 n_wp = active_wp.shape[0]
-                if abs(heading_err) > wrong_way_threshold and i_near < n_wp - 2:
-                    set_waypoint_index_safe(i_near)
+                current_wpi = int(getattr(pure_pursuit, "wpi", 0)) if hasattr(pure_pursuit, "wpi") else 0
+                if (
+                    active_name != "TO_DROPOFF"
+                    and abs(heading_err) > GENERIC_WRONG_WAY_THRESHOLD
+                    and cte > GENERIC_WRONG_WAY_CTE_M
+                    and i_near < n_wp - 2
+                    and t >= segment_started_t + GENERIC_WRONG_WAY_START_GRACE_S
+                    and t >= last_generic_wrong_way_resync_t + GENERIC_WRONG_WAY_RESYNC_COOLDOWN_S
+                ):
+                    resync_idx = max(i_near, current_wpi)
+                    if compact_track and cte > HIGH_CTE_M:
+                        resync_idx = min(resync_idx + 1, n_wp - 2)
+                    set_waypoint_index_safe(resync_idx)
+                    last_generic_wrong_way_resync_t = t
                     if debug_print and t > wrong_way_print_until:
                         wrong_way_print_until = t + 2.0
-                        wpx = float(active_wp[i_near, 0]) if i_near < len(active_wp) else float('nan')
-                        wpy = float(active_wp[i_near, 1]) if i_near < len(active_wp) else float('nan')
-                        msg = (f"wrong-way resync wpi->{i_near} heading_err_deg={math.degrees(heading_err):.0f} "
-                               f"pose=({pose_x:.2f},{pose_y:.2f}) wpt=({wpx:.2f},{wpy:.2f})")
+                        wpx = float(active_wp[resync_idx, 0]) if resync_idx < len(active_wp) else float('nan')
+                        wpy = float(active_wp[resync_idx, 1]) if resync_idx < len(active_wp) else float('nan')
+                        msg = (f"wrong-way resync wpi->{resync_idx} heading_err_deg={math.degrees(heading_err):.0f} "
+                               f"cte={cte:.2f} pose=({pose_x:.2f},{pose_y:.2f}) wpt=({wpx:.2f},{wpy:.2f})")
                         print(f"[NAV] {msg}")
                         try:
                             _dbg2("NAV", "wrong_way_resync", msg,
-                                  {"i_near": int(i_near), "heading_err_deg": math.degrees(heading_err), "pose": [pose_x, pose_y], "wpt": [wpx, wpy]})
+                                  {"i_near": int(i_near), "resync_wpi": int(resync_idx), "heading_err_deg": math.degrees(heading_err), "cte_m": float(cte), "pose": [pose_x, pose_y], "wpt": [wpx, wpy]})
                         except Exception:
                             pass
 
@@ -1800,26 +1960,23 @@ def run_scenario(
                     speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
                 # else: no cap – keep full speed for straights and gentle curves
 
-                # Cross-track error – only slow when really off path
-                cte = float(np.linalg.norm(
-                    np.array([pose_x, pose_y]) - np.array(pure_pursuit.p_ref)))
-                MAX_CTE_M = 0.75
-                if cte > MAX_CTE_M:
-                    speed_cmd = min(speed_cmd, 0.62)
+                # Cross-track error – use actual low-speed caps on the compact 1/10 route.
+                if cte > HIGH_CTE_M:
+                    speed_cmd = min(speed_cmd, HIGH_CTE_SPEED_CAP)
                     if debug_print and t > wrong_way_print_until:
                         wrong_way_print_until = t + 2.0
                         msg = (f"Large cross-track error: {cte:.2f}m - reducing speed "
-                               f"pose=({pose_x:.2f},{pose_y:.2f}) nearest_wpi={i_near}")
+                               f"pose=({pose_x:.2f},{pose_y:.2f}) nearest_wpi={i_near} lookahead={pure_pursuit.lookahead:.2f}")
                         print(f"[NAV] {msg}")
                         try:
                             _dbg2("NAV", "large_cte", msg,
-                                  {"cte_m": float(cte), "pose": [pose_x, pose_y], "nearest_wpi": int(i_near)})
+                                  {"cte_m": float(cte), "pose": [pose_x, pose_y], "nearest_wpi": int(i_near), "lookahead_m": float(pure_pursuit.lookahead)})
                         except Exception:
                             pass
-                elif cte > 0.40:
-                    speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
-                elif cte > 0.30:
-                    speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
+                elif cte > MID_CTE_M:
+                    speed_cmd = min(speed_cmd, MID_CTE_SPEED_CAP)
+                elif cte > LOW_CTE_M:
+                    speed_cmd = min(speed_cmd, LOW_CTE_SPEED_CAP)
 
                 if abs_plan_steer >= TURN_ACTIVE_STEER_ON:
                     turn_latch_until = max(turn_latch_until, t + TURN_ACTIVE_HOLD_S)
@@ -2045,11 +2202,11 @@ def run_scenario(
             # when on the TO_HUB segment and reasonably close to the goal to prioritize
             # pure-pursuit completion.
             try:
-                # Fully suppress sidewalk detection and responses for the entire
-                # return-to-hub segment. This avoids repeated false-positive curb
-                # detections that currently cause oscillatory recoveries and
-                # heading flips when finishing the route.
-                if active_name == "TO_HUB":
+                # Suppress sidewalk guard for all pre-mapped segments where
+                # white track tiles cause persistent false positives.
+                # TO_HUB: false-positive curb detections near hub return.
+                # TO_PICKUP: white tiles along entire bottom straight look like sidewalk.
+                if active_name in ("TO_HUB", "TO_PICKUP"):
                     sidewalk_strong = False
                     sidewalk_soft = False
                     sidewalk_detected = False
@@ -2347,14 +2504,20 @@ def run_scenario(
                 if active_name == "TO_HUB":
                     cte_stuck_streak_s = 0.0
                 else:
-                    if cte > CTE_LARGE_M and speed_cmd < 0.1:
+                    # Trigger when: large CTE + either speed_cmd is low OR the car is not moving
+                    # (the car may keep commanding speed into the wall — dr_speed is the ground truth)
+                    if cte > CTE_LARGE_M and (speed_cmd < 0.1 or dr_speed < 0.04):
                         cte_stuck_streak_s += dt
                         if cte_stuck_streak_s > CTE_STUCK_TIMEOUT_S:
-                            # Force recovery: creep forward to rejoin path
-                            # Override any stop reason and ensure minimum speed
-                            speed_cmd = max(min(speed_cmd, 0.20), 0.20)
-                            stop_reason = "cte_stuck_recover"  # Override any previous stop reason
-                            steer_raw = clamp(target_steer, -0.40, 0.40)
+                            # Force recovery: reverse away from wall then creep forward to rejoin path
+                            cte_stuck_streak_s = 0.0
+                            recover_stuck_streak_s = 0.0
+                            recover_trigger_count += 1
+                            recover_reverse_until = t + float(RECOVER_REVERSE_S) * 1.5
+                            recover_forward_until = recover_reverse_until + float(RECOVER_FORWARD_S) * 1.2
+                            recover_cooldown_until = t + float(RECOVER_COOLDOWN_S)
+                            recover_reason = "cte_stuck_wall"
+                            stop_reason = "cte_stuck_recover"
                     else:
                         cte_stuck_streak_s = 0.0
 
@@ -2749,16 +2912,16 @@ def run_scenario(
 
             # LED colour (segment-aware)
             if t < start_magenta_until or step_name in ("HUB_WAIT", "DONE"):
-                led_arr = np.array([0, 0, 0, 0, 1, 0, 1, 1], dtype=np.float64)
+                led_arr = np.array([0, 0, 0, 0, 1, 0, 0, 0], dtype=np.float64)
                 _led_rgb = (1.0, 0.0, 1.0)
             elif step_name == "TO_DROPOFF":
-                led_arr = np.array([0, 0, 0, 0, 0, 1, 1, 1], dtype=np.float64)
+                led_arr = np.array([0, 0, 0, 0, 0, 1, 0, 0], dtype=np.float64)
                 _led_rgb = (0.0, 0.0, 1.0)
             elif step_name in ("TO_HUB", "PARK"):
-                led_arr = np.array([1, 1, 1, 1, 0, 0, 1, 1], dtype=np.float64)
+                led_arr = np.array([0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float64)
                 _led_rgb = (1.0, 0.5, 0.0)
             else:
-                led_arr = np.array([0, 0, 0, 0, 0, 0, 1, 1], dtype=np.float64)
+                led_arr = np.array([0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float64)
                 _led_rgb = (0.0, 1.0, 0.0)
 
             car.read_write_std(throttle=throttle, steering=steer_out, LEDs=led_arr)
@@ -2810,6 +2973,9 @@ def run_scenario(
             if sw_dbg is not None:
                 cv2.imshow("lane_sw_debug", sw_dbg)
 
+            lidar_map_img = _lidar_mapper.render()
+            cv2.imshow("lidar_map", lidar_map_img)
+
             cv2.waitKey(1)
 
             # Pacing
@@ -2854,7 +3020,7 @@ def main() -> None:
     ap.add_argument("--waypoints", default="waypoints.txt")
     ap.add_argument("--actor", type=int, default=0)
     ap.add_argument("--rate", type=float, default=30.0)
-    ap.add_argument("--speed", type=float, default=6.0)
+    ap.add_argument("--speed", type=float, default=0.6)
     ap.add_argument("--no-print", action="store_true")
     ap.add_argument("--no-lidar", action="store_true")
     ap.add_argument("--no-realsense", action="store_true")

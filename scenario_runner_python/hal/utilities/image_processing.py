@@ -520,3 +520,52 @@ class ImageProcessing():
         except:
             lines = 0
         return linesImage, lines
+
+
+def mask_to_center_poly(mask, degree=2, min_points=50):
+    """Convert a binary lane mask to a centerline polynomial (x = f(y)).
+
+    Returns (coeffs, ys, xs_fitted) where coeffs are poly coefficients (highest-first),
+    ys is the list of y rows used, and xs_fitted are the fitted x positions for those ys.
+    If insufficient data, returns (None, None, None).
+    """
+    if mask is None:
+        return None, None, None
+    # ensure binary uint8
+    m = (mask > 0).astype('uint8')
+    h, w = m.shape
+    ys = []
+    xs = []
+    # sample rows from lower part of image upwards
+    for y in range(h-1, int(h*0.3), -4):
+        row = m[y]
+        cols = np.where(row > 0)[0]
+        if cols.size == 0:
+            continue
+        # take median of connected component as representative x
+        x_med = int(np.median(cols))
+        ys.append(h - y)  # invert y to have forward distance
+        xs.append(x_med)
+
+    if len(xs) < min_points:
+        # not enough points
+        return None, None, None
+
+    xs = np.array(xs)
+    ys = np.array(ys)
+
+    # Fit polynomial x = p(y) of given degree using numpy.polyfit (y as independent)
+    try:
+        coeffs = np.polyfit(ys, xs, degree)
+        # compute fitted xs for the sampled ys
+        xs_fitted = np.polyval(coeffs, ys)
+        # convert ys back to image rows
+        ys_img = (h - ys).astype(int)
+        return coeffs, ys_img, xs_fitted.astype(int)
+    except Exception:
+        return None, None, None
+
+
+def warp_perspective(frame, M, dsize):
+    """Apply homography M to frame returning warped image of size dsize (w,h)."""
+    return cv2.warpPerspective(frame, M, dsize, flags=cv2.INTER_LINEAR)
