@@ -294,6 +294,30 @@ def clamp(x: float, lo: float, hi: float) -> float:
 def wrap_pi(a: float) -> float:
     return float((a + math.pi) % (2.0 * math.pi) - math.pi)
 
+
+def estimate_local_curvature(pts: np.ndarray, idx: int, step: int = 3) -> float:
+    """Estimate local path curvature (rad/m) around waypoint index idx."""
+    if pts is None or pts.ndim != 2 or pts.shape[0] < (2 * step + 1):
+        return 0.0
+    n = int(pts.shape[0])
+    i0 = max(0, int(idx) - step)
+    i2 = min(n - 1, int(idx) + step)
+    i1 = (i0 + i2) // 2
+    p0 = pts[i0]
+    p1 = pts[i1]
+    p2 = pts[i2]
+    v1 = p1 - p0
+    v2 = p2 - p1
+    l1 = float(np.linalg.norm(v1))
+    l2 = float(np.linalg.norm(v2))
+    if l1 < 1e-4 or l2 < 1e-4:
+        return 0.0
+    h1 = math.atan2(float(v1[1]), float(v1[0]))
+    h2 = math.atan2(float(v2[1]), float(v2[0]))
+    dtheta = abs(wrap_pi(h2 - h1))
+    ds = max(1e-3, l1 + l2)
+    return float(dtheta / ds)
+
 # ===================================================================
 #  Waypoints
 # ===================================================================
@@ -353,8 +377,8 @@ def interpolate_waypoints(pts: np.ndarray, spacing: float = 1.0) -> np.ndarray:
     return np.column_stack([x_new, y_new])
 
 # ===================================================================
-#  Map Data  (from Setup_Real_Scenario_fullscale_x10.py)
-#  All coordinates are in pre-fs 1:1 scale (before the ×10 scaling).
+#  Map Data  
+#  All coordinates are in pre-fs 1:1 scale.
 #  facing_deg is the rotation from the Setup file – the direction the
 #  sign's face points toward approaching traffic.
 # ===================================================================
@@ -713,10 +737,12 @@ class LaneController:
 
         steer = self.k_lat * err + self.k_head * head_err + self.kd * derr
         steer = clamp(steer, -self.max_steer, self.max_steer)
-        self.steer_smooth = 0.78 * self.steer_smooth + 0.22 * steer
+        # Stronger smoothing for perfectly smooth lane steering
+        self.steer_smooth = 0.92 * self.steer_smooth + 0.08 * steer
         steer = self.steer_smooth
 
-        lane_ok = bool(conf > 0.18)
+        # Higher confidence threshold - only use lane when we're very sure
+        lane_ok = bool(conf > 0.45)
         if lane_ok:
             self.last_good_time = t_now
             self.last_good_steer = steer
@@ -758,7 +784,7 @@ class LaneController:
         return float(steer), bool(lane_ok), float(conf), float(err), dbg, xl_ret, xr_ret, y0_roi
 
 # ===================================================================
-#  Sidewalk / Curb Guard
+#  Sidewalk / Curb Guard - AGGRESSIVE WHITE DETECTION
 # ===================================================================
 
 class SidewalkGuard:
@@ -772,90 +798,82 @@ class SidewalkGuard:
             return 0.0, 0.0, 0.0, None
 
         H, W = bgr.shape[:2]
-        # Never start the sidewalk ROI above 60% down the image – the lane-detection
-        # top boundary (0.35*H) would pull in the bright QLabs background tiles.
-        _y0_raw = int(lane_y0) if (lane_y0 is not None) else int(0.72 * H)
-        y0 = max(_y0_raw, int(0.60 * H))
-        roi = bgr[y0:H, :]
+
+        # CRITICAL: Look at bottom HALF of image to detect white sidewalk/curb
+        # Use lower 50% of image for detection (where car + road ahead is)
+        y_start = int(0.50 * H)
+        roi = bgr[y_start:H, :]
         rH, rW = roi.shape[:2]
 
+        # Convert to HSV for white detection
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
-        s = hsv[:, :, 1].astype(np.float32)
-        v = hsv[:, :, 2].astype(np.float32)
-        L = lab[:, :, 0].astype(np.float32)
 
-        py1, py2 = int(0.55 * rH), int(0.95 * rH)
-        px1, px2 = int(0.35 * rW), int(0.65 * rW)
-        patch_L = L[py1:py2, px1:px2]
-        patch_s = s[py1:py2, px1:px2]
-        patch_v = v[py1:py2, px1:px2]
-        if patch_L.size:
-            L_med = float(np.percentile(patch_L, 35))
-            s_med = float(np.percentile(patch_s, 55))
-            v_med = float(np.percentile(patch_v, 35))
-        else:
-            L_med, s_med, v_med = 120.0, 40.0, 120.0
+        # CURB DETECTION: Look for VERY bright white (sidewalk/curb only, not road markings)
+        # Sidewalk in QLabs is PURE WHITE - much brighter than road
+        # Use HIGH thresholds to ignore road markings and only detect actual curbs
+        white_mask = cv2.inRange(hsv, np.array([0, 0, 220]), np.array([180, 30, 255]))
 
-        # NOTE: sw_center/sw_near are MEANS of a binary mask in [0,1]. In bright QLabs lighting,
-        # the older thresholds were overly permissive and frequently classified asphalt as "sidewalk".
-        # Tighten the LAB/HSV thresholds so only truly over-bright, low-saturation regions trigger.
-        sw_rel = (
-            (L > (L_med + 88.0))           # was 75 – need more contrast vs asphalt
-            & (s < min(28.0, s_med + 6.0)) # was 35/8 – tighter saturation gate
-            & (v > (v_med + 65.0))         # was 55 – brighter foreground needed
-        )
-        sw_abs = (L > 245.0) & (s < 28.0) & (v > 238.0)  # was 240/35/230
-        sw = (sw_rel | sw_abs).astype(np.uint8) * 255
-        sw = cv2.morphologyEx(sw, cv2.MORPH_OPEN, self.kernel, iterations=2)  # was 1
-        sw = cv2.morphologyEx(sw, cv2.MORPH_CLOSE, self.kernel, iterations=2)
+        # Also detect very bright areas (curb only) - HIGH threshold
+        v = hsv[:, :, 2]
+        bright_mask = (v > 230).astype(np.uint8) * 255
+
+        # Combine masks - only very bright white
+        sw = cv2.bitwise_or(white_mask, bright_mask)
+        sw = cv2.morphologyEx(sw, cv2.MORPH_OPEN, self.kernel, iterations=1)
+        sw = cv2.morphologyEx(sw, cv2.MORPH_CLOSE, self.kernel, iterations=1)
 
         sw_bin = (sw > 0).astype(np.float32)
 
-        if xl is None or xr is None or not np.isfinite(xl) or not np.isfinite(xr):
-            sw_center, sw_bias, sw_near = 0.0, 0.0, 0.0
-        else:
+        # Calculate sidewalk metrics based on entire bottom ROI
+        # Left and right side detection
+        left_region = sw_bin[:, :int(0.4 * rW)]  # Left 40%
+        right_region = sw_bin[:, int(0.6 * rW):]  # Right 40%
+        center_region = sw_bin[:, int(0.3 * rW):int(0.7 * rW)]  # Center 40%
+
+        sw_left = float(left_region.mean())
+        sw_right = float(right_region.mean())
+        sw_center = float(center_region.mean())
+
+        # Calculate bias: positive = sidewalk on right, negative = sidewalk on left
+        total = sw_left + sw_right + 1e-6
+        sw_bias = clamp((sw_right - sw_left) / total, -1.0, 1.0)
+
+        # Near detection - bottom portion where wheels are
+        wheel_region = sw_bin[int(0.7 * rH):, :]
+        sw_near = float(wheel_region.mean())
+
+        # If we have lane lines, refine the detection
+        if xl is not None and xr is not None and np.isfinite(xl) and np.isfinite(xr):
             xl_i = int(np.clip(xl, 0, rW - 1))
             xr_i = int(np.clip(xr, 0, rW - 1))
             if xl_i > xr_i:
                 xl_i, xr_i = xr_i, xl_i
-            # CRITICAL: Use TIGHTER boundaries - minimal padding to prevent sidewalk encroachment
-            # Reduced padding from 3% to 1% for tighter lane definition
-            pad = int(0.01 * rW)  # Much tighter - was 0.03
-            xL = int(np.clip(xl_i + pad, 0, rW - 1))
-            xR = int(np.clip(xr_i - pad, 0, rW - 1))
-            if xR <= xL + 10:
-                sw_center, sw_bias, sw_near = 0.0, 0.0, 0.0
-            else:
-                band0 = int(0.45 * rH)
-                near = sw_bin[band0:, :]
-                out_left = float(near[:, :xL].mean()) if xL > 5 else 0.0
-                out_right = float(near[:, xR:].mean()) if xR < (rW - 5) else 0.0
-                denom = out_left + out_right + 1e-6
-                sw_bias = clamp((out_right - out_left) / denom, -1.0, 1.0)
 
-                lane_w = max(1, xR - xL)
-                # CRITICAL: Much tighter core padding - reduced from 18% to 5% for accuracy
-                # This ensures we only check the actual lane center, not extended boundaries
-                core_pad = int(max(2, 0.05 * lane_w))  # Much tighter - was 0.18
-                cxL = xL + core_pad
-                cxR = xR - core_pad
-                if cxR <= cxL + 8:
-                    cxL, cxR = xL, xR
-                in_lane = near[:, cxL:cxR]
-                sw_center = float(in_lane.mean())
-                near0 = int(0.75 * rH)
-                sw_near = float(sw_bin[near0:, cxL:cxR].mean())
+            # Check outside lane boundaries
+            pad = int(0.05 * rW)
+            xL = max(0, xl_i - pad)
+            xR = min(rW - 1, xr_i + pad)
 
+            if xR > xL:
+                outside_left = sw_bin[:, :xL].mean() if xL > 5 else 0.0
+                outside_right = sw_bin[:, xR:].mean() if xR < rW - 5 else 0.0
+                total_out = outside_left + outside_right + 1e-6
+                sw_bias = clamp((outside_right - outside_left) / total_out, -1.0, 1.0)
+
+        # Create debug visualization
         dbg = cv2.cvtColor(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
-        dbg[sw > 0] = (0, 0, 255)
+        dbg[sw > 0] = (0, 0, 255)  # Red overlay for detected sidewalk
+
+        # Draw lane boundaries if available
         if xl is not None and xr is not None and np.isfinite(xl) and np.isfinite(xr):
             xl_i = int(np.clip(xl, 0, rW - 1))
             xr_i = int(np.clip(xr, 0, rW - 1))
             cv2.line(dbg, (xl_i, 0), (xl_i, rH - 1), (0, 255, 255), 2)
             cv2.line(dbg, (xr_i, 0), (xr_i, rH - 1), (0, 255, 255), 2)
+
         cv2.putText(dbg, f"swC={sw_center:.2f} swN={sw_near:.2f} swB={sw_bias:+.2f}",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
         return float(sw_center), float(sw_bias), float(sw_near), dbg
 
 # ===================================================================
@@ -903,8 +921,8 @@ def lidar_front(angles: np.ndarray, dist: np.ndarray
                 ) -> Tuple[float, float, float, float, bool]:
     if angles is None or dist is None:
         return float("inf"), float("inf"), 0.0, 0.0, False
-    a = (-angles + np.pi)
-    a = (a + np.pi) % (2.0 * np.pi) - np.pi
+    a_raw = (-angles + np.pi)
+    a = np.arctan2(np.sin(a_raw), np.cos(a_raw))
     d = dist.astype(np.float32, copy=False)
     ok = np.isfinite(d)
     f = ok & (np.abs(a) < math.radians(70.0))
@@ -1071,8 +1089,8 @@ def _polar_to_xy_car(angles: np.ndarray, distances: np.ndarray) -> np.ndarray:
     """Convert QCarLidar angles/distances to car-frame XY (x=forward, y=left)."""
     if angles is None or distances is None:
         return np.empty((0, 2), dtype=np.float32)
-    a = (-angles + np.pi).astype(np.float32)
-    a = (a + np.pi) % (2.0 * np.pi) - np.pi
+    a_raw = (-angles + np.pi).astype(np.float32)
+    a = np.arctan2(np.sin(a_raw), np.cos(a_raw)).astype(np.float32)
     d = distances.astype(np.float32, copy=False)
     valid = np.isfinite(d) & (d > 0.01) & (d <= 8.0)
     if not np.any(valid):
@@ -1202,15 +1220,19 @@ def run_scenario(
     compact_track = raw_max_abs <= 8.0
 
     def pure_pursuit_lookahead_m(segment_name: str) -> float:
+        # TIGHT LOOKAHEAD for precise tracking - less slop, more accuracy
         if segment_name == "PARK":
-            return 0.22 if compact_track else 0.35
+            return 0.18 if compact_track else 0.28
         if segment_name == "TO_HUB":
-            return 0.28 if compact_track else 0.60
-        return 0.35 if compact_track else 0.80
+            # Very tight lookahead for precise hub return
+            return 0.18 if compact_track else 0.35
+        # Default: tight lookahead for all segments
+        return 0.25 if compact_track else 0.50
 
     P_pick = interpolate_waypoints(paths["path_to_pickup"],  spacing=0.5)
     P_drop = interpolate_waypoints(paths["path_to_dropoff"], spacing=0.5)
-    P_hub  = interpolate_waypoints(paths["path_to_hub"],     spacing=0.5)
+    # Use denser hub waypoints so Pure Pursuit can hold tighter arcs.
+    P_hub  = interpolate_waypoints(paths["path_to_hub"],     spacing=0.25)
 
     route_segments: list[tuple[str, np.ndarray]] = [
         ("TO_PICKUP",  np.array(P_pick, dtype=np.float64) * waypoint_scale_m),
@@ -1344,6 +1366,11 @@ def run_scenario(
     segment_hold_until = 0.0
     SEGMENT_HOLD_S     = 2.0
     route_done         = False
+    route_done_reason  = ""
+    HUB_MIN_ACTIVE_S = 5.0
+    HUB_MIN_PROGRESS_FRAC = 0.10
+    HUB_MIN_PROGRESS_WP = 8
+    hub_gate_print_until = 0.0
 
     # ------------------------------------------------------------------
     # Final parking (after the last route segment)
@@ -1381,7 +1408,7 @@ def run_scenario(
         lookahead=pure_pursuit_lookahead_m(active_name),
         cyclic=False,
     )
-    pure_pursuit.maxSteeringAngle = 0.42
+    pure_pursuit.maxSteeringAngle = 0.50  # More steering for tighter tracking
     last_path_cte_m = 0.0
     if debug_print:
         print(f"[NAV] Pure Pursuit lookahead {active_name}={pure_pursuit.lookahead:.2f}m")
@@ -1435,13 +1462,18 @@ def run_scenario(
                 print(f"[NAV] Failed to set waypoint index {idx}: {e}")
 
     # ------------------------------------------------------------------
-    # Pure Pursuit + Vision: blend waypoints with lane for steering
+    # Pure Pursuit ONLY: disable lane detection entirely for clean path following
     # ------------------------------------------------------------------
-    FOLLOW_WAYPOINTS_ONLY = False  # Use lane + path so we center in lane, not road center
-    W_PURE_PURSUIT = 0.68   # Weight for waypoint steering
-    W_LANE         = 0.32   # Weight for lane (vision) – stronger so we track lane center
-    LANE_CONF_MIN  = 0.35   # Use lane in blend only when conf >= this
-    LANE_CONF_DEPART_MIN = 0.48   # Lane-depart logic only when conf above this
+    FOLLOW_WAYPOINTS_ONLY = True  # Disable lane - use only waypoints
+    TO_HUB_FORCE_WAYPOINTS_ONLY = True  # Return path is hand-mapped: suppress lane pull on TO_HUB.
+    W_PURE_PURSUIT = 0.95   # Weight for waypoint steering - trust pure pursuit heavily
+    W_LANE         = 0.05   # Weight for lane centering correction - minimal
+
+    # Simple lookahead smoothing - balanced response
+    LOOKAHEAD_SMOOTH_ALPHA = 0.85  # Smoothing factor
+    LOOKAHEAD_SMOOTH_BETA = 0.15   # Response factor
+    LANE_CONF_MIN  = 0.55   # Use lane in blend only when conf >= this (increased for stability)
+    LANE_CONF_DEPART_MIN = 0.65   # Lane-depart logic only when conf above this (higher for stability)
     DRIFT_CTE_PURE_PURSUIT_M = 0.28   # When CTE exceeds this, use pure pursuit only (ignore lane)
     TURN_LANE_BLEND_MAX   = 0.01
     LANE_ONLY_CONF_MIN    = 0.72
@@ -1463,8 +1495,8 @@ def run_scenario(
     OBSTACLE_STOP_CONFIRM_S = 0.22
 
     # Reverse recovery (unstick when wedged against curb/wall)
-    # NOTE: This is intentionally conservative and gated; disable via CLI with --no-recover if needed.
-    RECOVER_ENABLE          = bool(recover_enable)
+    # DISABLED: Recovery mode causes steering interference - disabled for clean driving
+    RECOVER_ENABLE          = False
     RECOVER_STUCK_CONFIRM_S = 0.80
     RECOVER_REVERSE_S       = 1.10
     RECOVER_REVERSE_SPEED   = 0.075
@@ -1486,17 +1518,15 @@ def run_scenario(
     WRONG_SIDE_STEER_RIGHT = -0.43  # Steer hard right to get back (negative = right)
     WRONG_SIDE_SPEED = 0.160        # Speed while correcting (fast enough to rejoin, not crawl)
 
-    # EXTREME sidewalk guard – never broken by any other logic.
-    # SidewalkGuard returns MEANS of a binary mask (0..1). Tune thresholds accordingly.
-    # Empirically tuned from debug logs: values around 0.02–0.18 can occur on normal asphalt/edges.
-    # Only treat sidewalk as "confirmed dangerous" at substantially higher mask fractions.
-    SW_SLOW = 0.06        # Soft caution: small detected fraction
-    SW_STOP = 0.22        # Strong: only when a large fraction is detected
-    SW_NEAR_STOP = 0.18   # Near-sidewalk: slightly more sensitive than SW_STOP
-    SW_STRONG_CONFIRM_S = 0.15  # Confirm quickly, but avoid spikes
+    # Sidewalk guard – only trigger when actually on/near the curb
+    # Use higher thresholds to avoid false positives from road markings
+    SW_SLOW = 0.15        # Only trigger for significant white (was 0.005)
+    SW_STOP = 0.25        # Strong reaction needs more evidence (was 0.02)
+    SW_NEAR_STOP = 0.20   # Wheels must be near actual curb (was 0.01)
+    SW_STRONG_CONFIRM_S = 0.10  # Brief confirmation needed (was 0.02)
     SW_PROBE_CLEAR_M = 1.10
-    SW_PROBE_SPEED   = 0.012
-    SW_EXTREME_THRESHOLD = 0.18  # Final guard: very strong signal forces steer away + slow (unbreakable)
+    SW_PROBE_SPEED   = 0.15  # Faster escape speed
+    SW_EXTREME_THRESHOLD = 0.30  # Higher threshold for final enforcement (was 0.03)
 
     # ------------------------------------------------------------------
     # Runtime variables
@@ -1507,11 +1537,23 @@ def run_scenario(
     dt_nom    = 1.0 / float(sample_rate_hz)
     t_prev    = now()
 
+    # Simple steering smoothing - single low-pass filter
+    last_steer_smooth = 0.0
+
+    # Waypoint update timing
+    control_mode_until = 0.0  # Used for waypoint update cooldown
+
     # GPS pose (1:1 scale) – initialised from first waypoint as fallback
     # until first GPS read succeeds.
     pose_x  = float(route_segments[0][1][0, 0])
     pose_y  = float(route_segments[0][1][0, 1])
     pose_th = math.radians(-44.7)          # spawn heading
+
+    # Waypoint index stability variables - initialized after pose is defined
+    WP_UPDATE_MIN_DIST_M = 0.25    # Minimum distance moved before updating waypoint index
+    last_wp_update_x = pose_x      # Position of last waypoint update
+    last_wp_update_y = pose_y
+    WP_UPDATE_COOLDOWN_S = 0.1     # Minimum time between waypoint updates
 
     sidewalk_stop_streak_s    = 0.0
     sidewalk_strong_streak_s  = 0.0
@@ -1570,6 +1612,52 @@ def run_scenario(
         print(f"[INFO] QLabs runner starting  segment={active_name}")
 
     # ==================================================================
+    # DATA LOGGING FOR PAPER - ADDED FOR ACC 2026 PAPER
+    # ==================================================================
+    import csv
+    import os
+
+    # Create log directory with timestamp
+    log_dir = "paper_logs"
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Open log files
+    cte_log = open(os.path.join(log_dir, "cte_data.csv"), "w", newline="")
+    speed_log = open(os.path.join(log_dir, "speed_data.csv"), "w", newline="")
+    steer_log = open(os.path.join(log_dir, "steer_data.csv"), "w", newline="")
+    segment_log = open(os.path.join(log_dir, "segment_times.csv"), "w", newline="")
+    sign_log = open(os.path.join(log_dir, "sign_events.csv"), "w", newline="")
+
+    cte_writer = csv.writer(cte_log)
+    speed_writer = csv.writer(speed_log)
+    steer_writer = csv.writer(steer_log)
+    segment_writer = csv.writer(segment_log)
+    sign_writer = csv.writer(sign_log)
+
+    # Write headers
+    cte_writer.writerow(["time_s", "cte_m", "segment", "pose_x", "pose_y"])
+    speed_writer.writerow(["time_s", "speed_cmd_mps", "dr_speed_mps", "throttle"])
+    steer_writer.writerow(["time_s", "target_steer_rad", "lane_steer_rad", "steer_raw_rad", "steer_out_rad"])
+    segment_writer.writerow(["segment", "start_time_s", "end_time_s", "duration_s", "max_cte_m", "avg_cte_m", "success"])
+    sign_writer.writerow(["time_s", "sign_type", "sign_index", "x", "y", "dist_m"])
+
+    # Track segment data
+    segment_start_recorded = {}
+    segment_cte_values = {}  # Store CTE values per segment for avg calculation
+    sign_event_count = {
+        "stop": 0,
+        "yield": 0,
+        "roundabout": 0,
+        "red_light": 0,
+        "yellow_light": 0,
+        "green_light": 0
+    }
+    segment_times = {}  # Store durations per segment for mean/std later
+
+    # Flag to track if we've recorded segment completion this loop
+    segment_completed_this_frame = False
+
+    # ==================================================================
     #  MAIN LOOP
     # ==================================================================
     try:
@@ -1581,6 +1669,7 @@ def run_scenario(
             if not np.isfinite(dt) or dt <= 0.0:
                 dt = dt_nom
             
+            segment_completed_this_frame = False
 
             # ----------------------------------------------------------
             # 1. Sensor reads
@@ -1689,6 +1778,24 @@ def run_scenario(
                 d2 = (active_wp[:, 0] - pose_x) ** 2 + (active_wp[:, 1] - pose_y) ** 2
                 i_near = int(np.argmin(d2))
                 seg_max_idx = max(seg_max_idx, i_near)
+
+                # Waypoint index update with stability threshold to prevent micro-jumps
+                dist_since_wp_update = math.hypot(pose_x - last_wp_update_x, pose_y - last_wp_update_y)
+                wp_update_ready = dist_since_wp_update >= WP_UPDATE_MIN_DIST_M and t >= control_mode_until
+
+                # Keep Pure Pursuit index advancing on TO_HUB so it does not re-target
+                # stale points that can pull the car off the return corridor.
+                if active_name == "TO_HUB":
+                    try:
+                        current_wpi = int(getattr(pure_pursuit, "wpi", 0))
+                    except Exception:
+                        current_wpi = 0
+                    # Only update when we've moved enough and enough time has passed
+                    if i_near >= current_wpi + 2 and wp_update_ready:
+                        set_waypoint_index_safe(i_near)
+                        last_wp_update_x = pose_x
+                        last_wp_update_y = pose_y
+                        control_mode_until = t + WP_UPDATE_COOLDOWN_S
                 
                 # CRITICAL: Proactive wrong-way check near roundabouts.
                 # When heading left of path: force keep-right STEER (don’t just resync every frame).
@@ -1761,9 +1868,16 @@ def run_scenario(
                 # further out while still counting the segment as complete.
                 if active_name == "TO_HUB":
                     local_goal_radius = 1.0
+                    hub_elapsed_s = max(0.0, float(t - segment_started_t))
+                    hub_progress_gate = bool(
+                        seg_max_idx >= max(int(HUB_MIN_PROGRESS_WP), int(HUB_MIN_PROGRESS_FRAC * n_wp))
+                    )
+                    hub_gate_ready = bool((hub_elapsed_s >= HUB_MIN_ACTIVE_S) and hub_progress_gate)
                     # Require BOTH proximity AND 75% waypoint progress so the segment
                     # cannot complete instantly when dropoff and hub are physically close.
                     seg_complete = bool(
+                        hub_gate_ready
+                        and
                         (dist_to_goal <= local_goal_radius)
                         and (seg_max_idx >= max(0, int(0.75 * n_wp)))
                     )
@@ -1789,13 +1903,52 @@ def run_scenario(
                 # For TO_DROPOFF use the same tight 0.60m radius so the car must actually
                 # arrive at the goal before the segment advances.
                 _pp_done_radius = SEG_GOAL_RADIUS_M if active_name == "TO_DROPOFF" else SEG_GOAL_RADIUS_TAIL_M
-                pp_done = bool(pure_pursuit.pathComplete) and (dist_to_goal <= _pp_done_radius)
+                if active_name == "TO_HUB":
+                    _pp_done_gate = bool((hub_elapsed_s >= HUB_MIN_ACTIVE_S) and hub_progress_gate)
+                else:
+                    _pp_done_gate = True
+                pp_done = bool(pure_pursuit.pathComplete) and (dist_to_goal <= _pp_done_radius) and _pp_done_gate
+                if (
+                    debug_print
+                    and active_name == "TO_HUB"
+                    and (dist_to_goal <= local_goal_radius)
+                    and (seg_max_idx >= max(0, int(0.75 * n_wp)))
+                    and not hub_gate_ready
+                    and t > hub_gate_print_until
+                ):
+                    hub_gate_print_until = t + 1.5
+                    print(
+                        f"[NAV] TO_HUB completion gated elapsed={hub_elapsed_s:.1f}s/{HUB_MIN_ACTIVE_S:.1f}s "
+                        f"progress={seg_max_idx}/{n_wp} req>={max(int(HUB_MIN_PROGRESS_WP), int(HUB_MIN_PROGRESS_FRAC * n_wp))}"
+                    )
                 if (t >= segment_hold_until) and (seg_complete or pp_done):
                     segment_idx += 1
                     recover_trigger_count = 0  # reset so next segment starts fresh
+                    # Log segment completion (added for ACC 2026 paper)
+                    if not segment_completed_this_frame:
+                        try:
+                            end_t = t
+                            start_t = segment_start_recorded.get(active_name, segment_started_t)
+                            duration = end_t - start_t
+                            max_cte = max(segment_cte_values.get(active_name, [0])) if segment_cte_values.get(active_name) else 0
+                            avg_cte = (
+                                sum(segment_cte_values.get(active_name, [0])) / len(segment_cte_values.get(active_name, [1]))
+                                if segment_cte_values.get(active_name)
+                                else 0
+                            )
+                            segment_writer.writerow([active_name, start_t, end_t, duration, max_cte, avg_cte, True])
+                        except Exception:
+                            pass
+                        segment_times[active_name] = duration if 'duration' in locals() else 0
+                        segment_completed_this_frame = True
+                        # Reset for next segment
+                        segment_cte_values[active_name] = []
                     if segment_idx >= len(route_segments):
                         # Route finished → park in the space ahead (final manoeuvre)
+                        route_done_reason = f"segment_complete:{active_name}"
                         route_done = True
+                        if debug_print:
+                            print(f"[NAV] route_done reason={route_done_reason}")
                         if PARK_ENABLE and not parking_active:
                             parking_active = True
                             park_start_t = t
@@ -1848,7 +2001,7 @@ def run_scenario(
                         # use a shorter lookahead + softer steering for higher accuracy.
                         if active_name == "TO_HUB":
                             try:
-                                active_wp = interpolate_waypoints(active_wp, spacing=0.50)
+                                active_wp = interpolate_waypoints(active_wp, spacing=0.25)
                             except Exception:
                                 pass
                             pure_pursuit = PurePursuitController(
@@ -1856,12 +2009,12 @@ def run_scenario(
                                 lookahead=pure_pursuit_lookahead_m(active_name),
                                 cyclic=False,
                             )
-                            pure_pursuit.maxSteeringAngle = 0.38
+                            pure_pursuit.maxSteeringAngle = 0.50  # More steering for tighter tracking
                         else:
                             pure_pursuit.updatePath(active_wp.T, cyclic=False)
                             pure_pursuit.lookahead = pure_pursuit_lookahead_m(active_name)
                             pure_pursuit.set_waypoint_index(0)
-                            pure_pursuit.maxSteeringAngle = 0.42
+                            pure_pursuit.maxSteeringAngle = 0.50  # More steering for tighter tracking
                         segment_hold_until = t + SEGMENT_HOLD_S
                         if debug_print:
                             print(f"[NAV] Segment switch -> {active_name} lookahead={pure_pursuit.lookahead:.2f}m")
@@ -1908,17 +2061,51 @@ def run_scenario(
                 step_name = active_name
                 v_ctrl = max(0.20, dr_speed)
                 base_lookahead_m = pure_pursuit_lookahead_m(active_name)
-                if last_path_cte_m > MID_CTE_M:
-                    pure_pursuit.lookahead = max(0.18 if compact_track else 0.35, 0.70 * base_lookahead_m)
+                if active_name == "TO_HUB":
+                    # Adaptive lookahead for return-to-hub: moderate adjustments only
+                    hub_la_min = 0.30 if compact_track else 0.50  # Reasonable minimum
+                    hub_la_max = base_lookahead_m
+
+                    # Simple CTE-based adjustment
+                    if last_path_cte_m > HIGH_CTE_M:
+                        hub_la_des = hub_la_min
+                    elif last_path_cte_m > MID_CTE_M:
+                        hub_la_des = max(hub_la_min, 0.85 * base_lookahead_m)
+                    else:
+                        hub_la_des = base_lookahead_m
+
+                    hub_la_prev = float(getattr(pure_pursuit, "lookahead", base_lookahead_m))
+                    # Apply smoothing
+                    pure_pursuit.lookahead = clamp(
+                        LOOKAHEAD_SMOOTH_ALPHA * hub_la_prev + LOOKAHEAD_SMOOTH_BETA * hub_la_des,
+                        hub_la_min,
+                        hub_la_max,
+                    )
+                elif last_path_cte_m > MID_CTE_M:
+                    hub_la_prev = float(getattr(pure_pursuit, "lookahead", base_lookahead_m))
+                    hub_la_des = max(0.30 if compact_track else 0.50, 0.85 * base_lookahead_m)
+                    pure_pursuit.lookahead = LOOKAHEAD_SMOOTH_ALPHA * hub_la_prev + LOOKAHEAD_SMOOTH_BETA * hub_la_des
                 else:
-                    pure_pursuit.lookahead = base_lookahead_m
+                    # Keep lookahead stable - don't change it unnecessarily
+                    pass
                 target_steer = float(pure_pursuit.update(
                     np.array([pose_x, pose_y], dtype=np.float64), pose_th, v_ctrl))
-                target_steer = clamp(target_steer, -0.42, 0.42)
+                target_steer = clamp(target_steer, -0.50, 0.50)
 
                 cte = float(np.linalg.norm(
                     np.array([pose_x, pose_y]) - np.array(pure_pursuit.p_ref)))
                 last_path_cte_m = cte
+
+                # Log CTE data (add after cte is computed)
+                if 'cte' in locals() and 'active_name' in locals():
+                    try:
+                        cte_writer.writerow([t, cte, active_name, pose_x, pose_y])
+                    except Exception:
+                        pass
+                    # Store CTE for segment average
+                    if active_name not in segment_cte_values:
+                        segment_cte_values[active_name] = []
+                    segment_cte_values[active_name].append(cte)
 
                 # Wrong-way detection: only resync if heading is truly backwards (>90°)
                 # Trust Stanley path following - waypoints are correct!
@@ -1968,11 +2155,11 @@ def run_scenario(
                     speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
                 # Extra slow approach when returning to hub – avoid hitting wall
                 if active_name == "TO_HUB" and dist_to_goal < 4.0:
-                    speed_cmd = min(speed_cmd, 0.45)
+                    speed_cmd = min(speed_cmd, 0.38)
                 # Cap speed near the right-boundary section of TO_HUB (x > 1.3 m)
                 # The path passes through x≈2.07–2.11 which is close to the right wall.
                 if active_name == "TO_HUB" and pose_x > 1.3:
-                    speed_cmd = min(speed_cmd, 0.22)
+                    speed_cmd = min(speed_cmd, 0.18)
 
                 # Only slow for sharp curves – keep at least MIN_CRUISE_SPEED
                 abs_plan_steer = abs(target_steer)
@@ -1980,6 +2167,12 @@ def run_scenario(
                     speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
                 elif abs_plan_steer > 0.28:
                     speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
+                # Extra curve speed cap on TO_HUB to stay glued to tighter turns.
+                if active_name == "TO_HUB":
+                    if abs_plan_steer > 0.30:
+                        speed_cmd = min(speed_cmd, 0.15)
+                    elif abs_plan_steer > 0.22:
+                        speed_cmd = min(speed_cmd, 0.18)
                 # else: no cap – keep full speed for straights and gentle curves
 
                 # Cross-track error – use actual low-speed caps on the compact 1/10 route.
@@ -2063,6 +2256,13 @@ def run_scenario(
                     continue
                 sign_last_trigger[i] = t
 
+                # Log sign event (add after sign is triggered)
+                try:
+                    sign_writer.writerow([t, sign.sign_type, i, sign.x, sign.y, dist])
+                except Exception:
+                    pass
+                sign_event_count[sign.sign_type] = sign_event_count.get(sign.sign_type, 0) + 1
+
                 if sign.sign_type == "stop":
                     stop_sign_active = True
                     stop_sign_stopped_t = 0.0
@@ -2122,16 +2322,30 @@ def run_scenario(
                                     tl_green_until = 0.0
                                     if debug_print:
                                         print(f"[TL] RED  conf={sc:.2f}")
+                                    # Log traffic light event
+                                    try:
+                                        sign_event_count["red_light"] = sign_event_count.get("red_light", 0) + 1
+                                        sign_writer.writerow([t, "red_light", -1, tl.x if 'tl' in locals() else 0, tl.y if 'tl' in locals() else 0, 0])
+                                    except Exception:
+                                        pass
                                 elif sname == "traffic_light_yellow":
                                     tl_yellow_until = max(tl_yellow_until, t + TL_HOLD_S)
                                     if debug_print:
                                         print(f"[TL] YELLOW  conf={sc:.2f}")
+                                    try:
+                                        sign_event_count["yellow_light"] = sign_event_count.get("yellow_light", 0) + 1
+                                    except Exception:
+                                        pass
                                 elif sname == "traffic_light_green":
                                     tl_red_until = 0.0
                                     tl_yellow_until = 0.0
                                     tl_green_until = max(tl_green_until, t + TL_HOLD_S)
                                     if debug_print:
                                         print(f"[TL] GREEN  conf={sc:.2f}")
+                                    try:
+                                        sign_event_count["green_light"] = sign_event_count.get("green_light", 0) + 1
+                                    except Exception:
+                                        pass
                     except Exception:
                         pass
 
@@ -2218,42 +2432,17 @@ def run_scenario(
                 sidewalk_soft = True
                 sidewalk_detected = True
 
-            # Special-case: suppress sidewalk detection during close return-to-hub approach.
-            # False positives near the hub's curbs often trigger repeated cte_recover/sidewalk
-            # handling and cause oscillatory reverse/recover loops. Ignore sidewalk signals
-            # when on the TO_HUB segment and reasonably close to the goal to prioritize
-            # pure-pursuit completion.
-            try:
-                # Suppress sidewalk guard for all pre-mapped segments where
-                # white track tiles cause persistent false positives.
-                # TO_HUB: false-positive curb detections near hub return.
-                # TO_PICKUP: white tiles along entire bottom straight look like sidewalk.
-                if active_name in ("TO_HUB", "TO_PICKUP", "TO_DROPOFF"):
-                    sidewalk_strong = False
-                    sidewalk_soft = False
-                    sidewalk_detected = False
-                    sidewalk_confirmed = False
-                    swC = 0.0
-                    swN = 0.0
-                    swB = 0.0
-                    sw_latch_until = t  # clear any latching so it won't re-enable
-            except Exception:
-                pass
+            # NEVER suppress sidewalk detection - white curb/sidewalk detection is ALWAYS active
+            # The suppression code that was here was causing the car to drive onto white curbs
+            # Sidewalk safety is the #1 priority - always detect and avoid white areas
 
             # ----------------------------------------------------------
-            # 9. Steering mixer: Stanley + Lane + Roundabout bias
+            # 9. Steering mixer: Simple Pure Pursuit
             # ----------------------------------------------------------
-            # CRITICAL: In roundabouts, disable lane following - use Stanley path only
-            # Include wrong-way force-right period so we actually steer right instead of resync loop
-            in_roundabout_zone = bool(
-                rb_in_roundabout or rb_entry_zone or rb_exit_zone or rb_approach_zone
-                or t < rb_active_until or t < wrong_way_force_right_until
-            )
-            
-            # Drift: when CTE is high, use pure pursuit only (ignore lane) so we rejoin the path
-            wrong_way_correcting_steer = (t < wrong_way_force_right_until)
-            drift_cte_m = RB_WRONG_WAY_CTE_DRIFT_M if wrong_way_correcting_steer else DRIFT_CTE_PURE_PURSUIT_M
-            drifted = (not route_done) and (cte >= drift_cte_m)
+            # DISABLED: Wrong-way and roundabout logic - interfering with clean driving
+            in_roundabout_zone = False
+            wrong_way_correcting_steer = False
+            drifted = (not route_done) and (cte >= DRIFT_CTE_PURE_PURSUIT_M)
             # When drifted, do NOT use roundabout/wrong-way steering – follow pure pursuit to rejoin path
             # When FOLLOW_WAYPOINTS_ONLY: always follow green line – no roundabout/lane steer override
             # On TO_HUB we follow waypoints back to hub – do not apply roundabout keep-right or sidewalk_rb
@@ -2294,60 +2483,45 @@ def run_scenario(
                         elif rb_approach_zone:
                             speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
                 else:
-                    # Sidewalk detected in roundabout: avoid curb but NEVER follow lines left
-                    if swC > 0.05 or swN > 0.04:  # Very high detection
-                        speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
-                    else:
-                        speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
+                    # Sidewalk detected in roundabout: AGGRESSIVE curb avoidance
+                    speed_cmd = min(speed_cmd, SW_PROBE_SPEED)  # Slow down more
                     if not stop_reason:
                         stop_reason = "sidewalk_rb"
-                    # Heavy keep-right blend – lines/sidewalk must not override
-                    if swB > 0.15:  # Sidewalk on right – tiny ease left, still strong right
-                        steer_raw = clamp(0.15 * 0.25 + 0.85 * RB_KEEP_RIGHT_STEER, -0.60, 0.08)
-                    elif swB < -0.15:  # Sidewalk on left – full keep-right
+                    # STEER AWAY FROM CURB - don't just keep-right blindly!
+                    if swB > 0.05:  # Sidewalk/curb on right → steer left HARD
+                        steer_raw = 0.45  # Override roundabout keep-right
+                    elif swB < -0.05:  # Sidewalk/curb on left → steer right
                         steer_raw = RB_KEEP_RIGHT_STEER
                     else:
-                        steer_raw = clamp(0.2 * swB + 0.8 * RB_KEEP_RIGHT_STEER, -0.60, 0.25)
+                        steer_raw = RB_KEEP_RIGHT_STEER  # Default keep-right when no curb detected
                 
                 rb_bias_applied = True
             else:
-                # NORMAL MODE: Pure Pursuit (green line) or blend with lane
-                if FOLLOW_WAYPOINTS_ONLY or active_name == "TO_DROPOFF":
-                    # TO_DROPOFF: path is precisely mapped; dashed center lines pull the car
-                    # LEFT near the final right-turn to the goal.  Always trust pure pursuit.
-                    steer_raw = clamp(target_steer, -0.42, 0.42)
+                # SIMPLE MODE: Pure Pursuit always, with optional tiny lane correction
+                # NO mode switching, NO lane-only mode, NO hysteresis complexity
+                # Just follow the path with minimal centering help from lane detection
+
+                if FOLLOW_WAYPOINTS_ONLY or active_name == "TO_DROPOFF" or (TO_HUB_FORCE_WAYPOINTS_ONLY and active_name == "TO_HUB"):
+                    # Pure path following only - allow full steering authority
+                    steer_raw = clamp(target_steer, -0.50, 0.50)
                 elif drifted:
-                    steer_raw = clamp(target_steer, -0.40, 0.40)
-                elif lane_ok and lane_conf >= LANE_CONF_MIN:
-                    lane_w = W_LANE
-                    pp_w = W_PURE_PURSUIT
-                    if turning_active or abs(target_steer) >= TURN_ACTIVE_STEER_ON:
-                        lane_w = TURN_LANE_BLEND_MAX
-                        pp_w = 1.0 - lane_w
-                    # When strongly pressed against right wall (swB > 0.5) and lane steers right,
-                    # the detected "lane" is the blue center dashed line, not the real boundary.
-                    # Suppress lane contribution entirely and trust pure pursuit to steer left.
-                    if swB > 0.5 and lane_steer < 0.0:
-                        lane_w = 0.0
-                        pp_w = 1.0
-                    steer_raw = clamp(
-                        pp_w * target_steer + lane_w * lane_steer,
-                        -0.45, 0.45)
-                    if (abs(lane_err) > LANE_DEPART_ERR_LANE_ONLY
-                            and lane_conf >= LANE_ONLY_CONF_MIN
-                            and abs(target_steer) <= LANE_ONLY_MAX_PLAN_STEER
-                            and not turning_active
-                            and swB <= 0.5):  # Never lane-only when against right wall
-                        steer_raw = clamp(lane_steer, -0.34, 0.34)
+                    # When drifted, still allow good steering range
+                    steer_raw = clamp(target_steer, -0.48, 0.48)
+                elif lane_ok and lane_conf >= LANE_CONF_MIN and not turning_active:
+                    # Simple blend: Pure Pursuit + tiny lane centering correction
+                    centering_correction = clamp(-0.12 * lane_err, -0.06, 0.06)
+                    steer_raw = clamp(target_steer + centering_correction, -0.50, 0.50)
                 else:
-                    steer_raw = clamp(target_steer, -0.40, 0.40)
+                    # Default: pure path following
+                    steer_raw = clamp(target_steer, -0.50, 0.50)
+
                 rb_bias_applied = False
 
-            # Update turning latch from final steer
+            # Simple turning latch for debug/display only - don't use to disable lane
             if max(abs(steer_raw), abs(target_steer)) >= TURN_ACTIVE_STEER_ON:
                 turn_latch_until = max(turn_latch_until, t + TURN_ACTIVE_HOLD_S)
-            # Roundabouts are always considered "turning active" to reduce lane blend
-            turning_active = bool(t < turn_latch_until or in_roundabout_zone)
+            # Always allow lane correction - even during turns
+            turning_active = False
 
             # ----------------------------------------------------------
             # 10. Safety overrides (sidewalk guard already checked above)
@@ -2359,197 +2533,6 @@ def run_scenario(
             if lidar_valid:
                 obs_bias_terms.append(float(lidar_bias))
             obs_bias = float(sum(obs_bias_terms) / len(obs_bias_terms)) if obs_bias_terms else 0.0
-
-            # ============================================================
-            # SIDEWALK GUARD – EXTREME: never broken by roundabout, lane, or any other logic
-            # During wrong-way correction (wrong_way_force_right_until): never steer LEFT.
-            # ============================================================
-            in_recovery = bool(t < recover_reverse_until or t < recover_forward_until)
-            wrong_way_correcting = bool(t < wrong_way_force_right_until)
-            in_failover_creep = bool(t < failover_creep_until)
-            
-            
-            if sidewalk_confirmed and not in_recovery:
-                # If we've entered the failover creep latch (after exhausting rock recoveries),
-                # keep commanding a cautious creep (unless an obstacle/other hard stop already forced 0).
-                if in_failover_creep:
-                    if speed_cmd <= 1e-6:
-                        speed_cmd = SW_PROBE_SPEED
-                    stop_reason = stop_reason or "sidewalk_cte_failover"
-                    steer_raw = clamp(0.6 * steer_raw + 0.4 * target_steer, -0.45, 0.45)
-                cte = float(np.linalg.norm(
-                    np.array([pose_x, pose_y]) - np.array(pure_pursuit.p_ref)))
-                if swC > SW_STOP or swN > SW_NEAR_STOP:
-                    if cte > 0.25:
-                        # When CTE is large, treat as "off-path" rather than "on sidewalk" - allow recovery
-                        if cte > CTE_LARGE_M:
-                            # Large CTE: allow creep to rejoin path instead of full stop
-                            # Force minimum speed (don't let segment hold or other stops override recovery)
-                                speed_cmd = max(min(speed_cmd, 0.15), 0.15)
-                                sidewalk_stop_streak_s = 0.0
-                                # Don't force a CTE-based recovery while returning to hub - prefer
-                                # completing the pure-pursuit path instead of toggling recoveries.
-                                if active_name != "TO_HUB":
-                                    stop_reason = "cte_recover"  # Override any previous stop reason
-                                # Near the hub (final segment), sidewalk contrast around the right curb can
-                                # incorrectly push us left when we actually need to turn right to finish.
-                                # In that specific case, trust the path (pure pursuit) and ignore swB bias.
-                                if active_name == "TO_HUB":
-                                    steer_raw = clamp(target_steer, -0.45, 0.45)
-                                else:
-                                    steer_raw = clamp(target_steer + 0.30 * swB, -0.45, 0.45)
-                        # When wrong-way correcting near RB, allow creep so we can escape (sidewalk can be curb in roundabout)
-                        elif wrong_way_correcting:
-                            speed_cmd = min(speed_cmd, 0.22)
-                            sidewalk_stop_streak_s = 0.0
-                            if not stop_reason:
-                                stop_reason = "sidewalk_caution"
-                            steer_raw = max(steer_raw, -0.40)
-                        # When severely wrong-way + drifted, allow creep so pure pursuit can steer us away
-                        elif severe_wrong_way_active and drifted:
-                            speed_cmd = min(speed_cmd, 0.12)
-                            sidewalk_stop_streak_s = 0.0
-                            if not stop_reason:
-                                stop_reason = "sidewalk_caution"
-                            steer_raw = clamp(target_steer + 0.35 * swB, -0.45, 0.45)
-                        else:
-                            # If forward space exists and lane fit is strong, avoid hard-stopping on curb-color hints.
-                            # This prevents deadlock where sidewalk detection remains "confirmed" but rock recovery can't escape.
-                            _front_clear_for_creep = bool((center_front > 0.90) and (min_front > 0.55))
-                            _lane_strong = bool(lane_ok and (lane_conf is None or lane_conf >= 0.90))
-                            if _front_clear_for_creep and _lane_strong:
-                                speed_cmd = min(max(speed_cmd, SW_PROBE_SPEED), SW_PROBE_SPEED)
-                                sidewalk_stop_streak_s = 0.0
-                                stop_reason = "sidewalk_caution"
-                                steer_raw = clamp(0.6 * target_steer + 0.4 * (target_steer + 0.35 * swB), -0.45, 0.45)
-                            else:
-                                if not lane_ok and swC >= 0.70 and swN >= 0.70 and swB >= 0.90:
-                                    speed_cmd = 0.05
-                                    sidewalk_stop_streak_s = 0.0
-                                    stop_reason = "lane_lost_recover"
-                                elif target_steer > 0.15 and swB > -0.50 and center_front > 0.30:
-                                    # Pure pursuit says hard LEFT and swB is only mildly negative.
-                                    # This is the false-reading case: car is pressed against the RIGHT wall
-                                    # → xR goes off-screen → out_right≈0 → swB falsely negative.
-                                    # Allow a slow creep LEFT to escape; steer override below will steer left.
-                                    speed_cmd = 0.05
-                                    sidewalk_stop_streak_s = 0.0
-                                    stop_reason = "sidewalk_caution"
-                                else:
-                                    speed_cmd = 0.0
-                                    sidewalk_stop_streak_s += dt
-                                    if not stop_reason:
-                                        stop_reason = "sidewalk_stop"
-
-                            # Failover: if we've already tried rock recovery many times and are still in a long sidewalk_stop,
-                            # allow a cautious creep using path steering even when center_front is below the normal probe threshold.
-                            if (recover_trigger_count >= 8
-                                    and sidewalk_stop_streak_s > 10.0
-                                    and center_front > 0.65
-                                    and lane_ok
-                                    and (lane_conf is None or lane_conf >= 0.9)):
-                                speed_cmd = SW_PROBE_SPEED
-                                stop_reason = "sidewalk_cte_failover"
-                                steer_raw = clamp(0.6 * steer_raw + 0.4 * target_steer, -0.45, 0.45)
-                                sidewalk_stop_streak_s = 0.0
-                                failover_creep_until = max(failover_creep_until, t + 2.0)
-                                _dbg2("H2", "qcar2_detailed_scenario_runner.py:sidewalk_failover_creep",
-                                      "sidewalk_failover_creep",
-                                      {
-                                          "cte": float(cte),
-                                          "speed_cmd": float(speed_cmd),
-                                          "swC": float(swC),
-                                          "swN": float(swN),
-                                          "swB": float(swB),
-                                          "center_front": float(center_front),
-                                          "min_front": float(min_front),
-                                          "recover_trigger_count": int(recover_trigger_count),
-                                      })
-                        if not severe_wrong_way_active:
-                            if stop_reason == "lane_lost_recover":
-                                steer_raw = 0.45  # Force left turn (positive = LEFT)
-                            elif not wrong_way_correcting:
-                                if swB > 0.10:
-                                    steer_raw = 0.45   # Sidewalk on right → steer left
-                                elif swB < -0.10:
-                                    # Sidewalk on left → steer right UNLESS pure pursuit strongly says left.
-                                    # When xR is off-screen (pressed against right wall), swB goes falsely negative.
-                                    if swB > -0.50 and target_steer > 0.15:
-                                        steer_raw = clamp(target_steer, -0.45, 0.45)
-                                    else:
-                                        steer_raw = -0.45
-                                else:
-                                    # swB≈0: can't determine side from bias; trust pure pursuit
-                                    steer_raw = clamp(target_steer, -0.45, 0.45)
-                            elif swB < -0.10:
-                                if swB > -0.50 and target_steer > 0.15:
-                                    steer_raw = clamp(target_steer, -0.45, 0.45)
-                                else:
-                                    steer_raw = -0.45  # Wrong-way: sidewalk on left → steer right ok
-                            # else wrong_way_correcting and swB >= 0: keep keep-right
-                        if center_front > 1.20 and sidewalk_stop_streak_s > 0.25:
-                            speed_cmd = SW_PROBE_SPEED
-                            if not stop_reason:
-                                stop_reason = "sidewalk_recover"
-                            if not wrong_way_correcting:
-                                # When CTE is large, prioritize path-following to rejoin path
-                                if cte > CTE_LARGE_M:
-                                    steer_raw = clamp(0.7 * target_steer + 0.3 * steer_raw, -0.45, 0.45)
-                                else:
-                                    steer_raw = clamp(0.5 * steer_raw + 0.5 * target_steer, -0.45, 0.45)
-                    else:
-                        speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
-                        sidewalk_stop_streak_s = 0.0
-                        if not stop_reason:
-                            stop_reason = "sidewalk_caution"
-                        if wrong_way_correcting and swB > 0:
-                            steer_raw = max(steer_raw, -0.35)
-                        else:
-                            steer_raw = clamp(target_steer + 0.40 * swB, -0.45, 0.45)
-                else:
-                    speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
-                    sidewalk_stop_streak_s = 0.0
-                    if not stop_reason:
-                        stop_reason = "sidewalk_caution"
-                    if wrong_way_correcting and swB > 0:
-                        steer_raw = max(steer_raw, -0.35)
-                    else:
-                        steer_raw = clamp(target_steer + 0.35 * swB, -0.45, 0.45)
-
-            elif sidewalk_strong and not in_recovery:
-                speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
-                sidewalk_stop_streak_s = 0.0
-                if not stop_reason:
-                    stop_reason = "sidewalk_strong"
-                if wrong_way_correcting and swB > 0.15:
-                    steer_raw = max(steer_raw, -0.35)
-                elif swB > 0.15:
-                    steer_raw = 0.42   # Sidewalk on right → steer left
-                elif swB < -0.15:
-                    steer_raw = -0.42  # Sidewalk on left → steer right
-                else:
-                    steer_raw = clamp(target_steer + 0.40 * swB, -0.45, 0.45)
-
-            elif sidewalk_soft and not in_recovery:
-                speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
-                sidewalk_stop_streak_s = 0.0
-                # Avoid turning a soft sidewalk detection into a hard stop when
-                # we're inside/near a roundabout zone; prefer roundabout logic.
-                if not stop_reason and not in_roundabout_zone:
-                    stop_reason = "sidewalk_soft"
-                
-                # Special case: On TO_HUB segment near goal, trust path following over sidewalk detection
-                # This prevents false-positive curb detection from blocking completion
-                # Increased threshold to 8.0m to catch cases where car gets stuck further from hub
-                if active_name == "TO_HUB" and dist_to_goal <= 8.0:
-                    # Trust pure pursuit path - ignore sidewalk bias when close to hub
-                    steer_raw = clamp(target_steer, -0.45, 0.45)
-                elif wrong_way_correcting and swB > 0:
-                    steer_raw = max(steer_raw, -0.35)
-                else:
-                    steer_raw = clamp(target_steer + 0.35 * swB, -0.45, 0.45)
-            else:
-                sidewalk_stop_streak_s = 0.0
 
             # Timeout-based recovery for stuck state with large CTE
             # NOTE: Disabled while on TO_HUB to avoid triggering recoveries during final approach.
@@ -2575,79 +2558,6 @@ def run_scenario(
                             stop_reason = "cte_stuck_recover"
                     else:
                         cte_stuck_streak_s = 0.0
-
-            # Lane-lost guardrail - TRUST PATH FOLLOWING, don't stop for lane loss
-            # Waypoints are correct - if lane detection fails, trust Stanley
-            if lane_ok:
-                lane_lost_streak_s = 0.0
-            else:
-                lane_lost_streak_s += dt
-
-            # Lane lost - TRUST PATH FOLLOWING, don't stop unnecessarily
-            # Only slow down if lane lost AND we're significantly off path AND front blocked
-            # Otherwise trust Stanley path following - keep moving!
-            if not turning_active and not lane_ok and not in_roundabout_zone:
-                cte = float(np.linalg.norm(
-                    np.array([pose_x, pose_y]) - np.array(pure_pursuit.p_ref)))
-                # Only worry if VERY significantly off path AND front blocked
-                if cte > 0.50 and front_valid and min_front < SLOW_FRONT_M:  # Increased threshold
-                    speed_cmd = min(speed_cmd, LANE_LOST_SLOW_SPEED)
-                    if not stop_reason:
-                        stop_reason = "lane_lost"
-                    if not FOLLOW_WAYPOINTS_ONLY:
-                        steer_raw = clamp(target_steer + 0.20 * swB + 0.30 * obs_bias, -0.35, 0.35)
-                    # NEVER hard stop for lane loss - just slow down
-                    # Trust path following will get us back on track
-                else:
-                    # Trust path following - lane detection is just a helper
-                    lane_lost_streak_s = 0.0
-
-            # Lane departure guardrail - only when vision is good; else trust waypoints
-            # When FOLLOW_WAYPOINTS_ONLY or drifted, skip so we follow path
-            if (not FOLLOW_WAYPOINTS_ONLY and not drifted and not turning_active and lane_ok
-                    and lane_conf >= LANE_CONF_DEPART_MIN and not in_roundabout_zone):
-                abs_lane_err = abs(float(lane_err))
-                cte = float(np.linalg.norm(
-                    np.array([pose_x, pose_y]) - np.array(pure_pursuit.p_ref)))
-                
-                # Only worry about lane departure if we're also off path
-                # If following path correctly, lane error is just visual
-                if abs_lane_err >= LANE_DEPART_ERR_STOP and cte > 0.30:
-                    lane_depart_stop_streak_s += dt
-                    # Blend lane correction with path following
-                    steer_raw = clamp(0.4 * lane_steer + 0.6 * target_steer, -LANE_DEPART_STEER_MAX, LANE_DEPART_STEER_MAX)
-                    if front_valid and center_front > LANE_DEPART_RECOVER_CLEAR_M:
-                        speed_cmd = min(speed_cmd, LANE_DEPART_RECOVER_SPEED)
-                        if not stop_reason:
-                            stop_reason = "lane_depart_recover"
-                    elif lane_depart_stop_streak_s <= LANE_DEPART_STOP_GRACE_S:
-                        speed_cmd = 0.0
-                        stop_reason = "lane_depart_stop"
-                    else:
-                        speed_cmd = min(speed_cmd, 0.36)
-                        if not stop_reason:
-                            stop_reason = "lane_depart_creep"
-                elif abs_lane_err >= LANE_DEPART_ERR_SLOW and cte > 0.20:
-                    lane_depart_stop_streak_s = 0.0
-                    speed_cmd = min(speed_cmd, 0.70)
-                    if not stop_reason:
-                        stop_reason = "lane_depart_slow"
-                    # Blend lane with path
-                    steer_raw = clamp(0.3 * lane_steer + 0.7 * target_steer, -0.40, 0.40)
-                else:
-                    lane_depart_stop_streak_s = 0.0
-            else:
-                lane_depart_stop_streak_s = 0.0
-
-            # Side-obstacle bypass
-            side_obstacle_only = bool(
-                front_valid and lane_ok and lane_conf > 0.70
-                and center_front > SIDE_BYPASS_CLEAR_M and min_front < 0.55)
-            if side_obstacle_only:
-                speed_cmd = min(speed_cmd, 0.55)
-                steer_raw = clamp(steer_raw + 0.22 * obs_bias, -0.35, 0.35)
-                if not stop_reason:
-                    stop_reason = "side_bypass"
 
             # Hard obstacle stop
             hard_stop_raw = False
@@ -2689,6 +2599,10 @@ def run_scenario(
                     and lane_ok
                     and dist_to_goal < 1.5
                 )
+                _hub_gate_ready_now = bool(
+                    (t - segment_started_t) >= HUB_MIN_ACTIVE_S
+                    and seg_max_idx >= max(int(HUB_MIN_PROGRESS_WP), int(HUB_MIN_PROGRESS_FRAC * max(1, int(active_wp.shape[0]))))
+                )
 
                 _side_only_very_close = bool((min_front < 0.25) and (center_front >= CENTER_STOP_M))
                 # When we're already in a pure CTE-based recovery with good lane signal (typical near the hub),
@@ -2700,14 +2614,31 @@ def run_scenario(
                     and min_front > 0.20
                 )
 
-                if _hub_arrival_blocked:
+                if _hub_arrival_blocked and _hub_gate_ready_now:
+                    route_done_reason = "hub_arrival_blocked"
                     route_done = True
                     speed_cmd = 0.0
                     stop_reason = "hub_wait"
+                    if debug_print:
+                        print(
+                            f"[NAV] route_done reason={route_done_reason} "
+                            f"dist_to_goal={dist_to_goal:.2f} center_front={center_front:.2f} min_front={min_front:.2f}"
+                        )
+                elif _hub_arrival_blocked and (not _hub_gate_ready_now):
+                    speed_cmd = min(speed_cmd, 0.12)
+                    if not stop_reason or stop_reason.startswith("obstacle"):
+                        stop_reason = "hub_gate_hold"
+                    if debug_print and t > hub_gate_print_until:
+                        hub_gate_print_until = t + 1.5
+                        req_wp = max(int(HUB_MIN_PROGRESS_WP), int(HUB_MIN_PROGRESS_FRAC * max(1, int(active_wp.shape[0]))))
+                        print(
+                            f"[NAV] hub-arrival gate hold elapsed={max(0.0, t-segment_started_t):.1f}s/{HUB_MIN_ACTIVE_S:.1f}s "
+                            f"progress={seg_max_idx} req>={req_wp} dist={dist_to_goal:.2f}"
+                        )
                 elif _side_only_very_close:
                     # Slow and steer away, but avoid deadlocking into obstacle-stop/recovery loops.
                     speed_cmd = min(speed_cmd, 0.12)
-                    steer_raw = clamp(steer_raw + 0.22 * float(obs_bias), -0.45, 0.45)
+                    steer_raw = clamp(steer_raw + 0.22 * float(obs_bias), -0.50, 0.50)
                     if not stop_reason:
                         stop_reason = "obstacle_side"
                 elif _cte_recover_creep:
@@ -2736,169 +2667,17 @@ def run_scenario(
             elif abs_steer > 0.25:
                 speed_cmd = min(speed_cmd, MOD_STEER_SPEED_CAP)
 
-            # Reverse recovery when wedged against curb / wall
-            # Use world-transform heading vs path tangent to steer toward path (reorient, not just rock).
-            if RECOVER_ENABLE:
-                if t < recover_reverse_until:
-                    # Back up: steer to align pose_th toward path (pure_pursuit.th_ref) so we reorient.
-                    speed_cmd = -float(RECOVER_REVERSE_SPEED)
-                    if recover_reason:
-                        stop_reason = recover_reason
-                    align_err = math.atan2(
-                        math.sin(pure_pursuit.th_ref - pose_th), math.cos(pure_pursuit.th_ref - pose_th))
-                    align_steer = clamp(float(align_err) * 1.0, -0.45, 0.45)
-                    steer_raw = clamp(
-                        align_steer + 0.35 * float(obs_bias) + 0.30 * float(swB),
-                        -0.45, 0.45,
-                    )
-                    # Wrong-way in roundabout: bias steer right so we actually rotate (correct circulation)
-                    if "wrongway_rb" in (recover_reason or ""):
-                        steer_raw = max(steer_raw, 0.38)
-
-                elif t < recover_forward_until:
-                    # Forward: keep aligning to path so we drive out the right way.
-                    speed_cmd = float(RECOVER_FORWARD_SPEED)
-                    if recover_reason:
-                        stop_reason = recover_reason
-                    align_err = math.atan2(
-                        math.sin(pure_pursuit.th_ref - pose_th), math.cos(pure_pursuit.th_ref - pose_th))
-                    align_steer = clamp(float(align_err) * 0.9, -0.45, 0.45)
-                    steer_raw = clamp(
-                        align_steer + 0.25 * float(obs_bias) + 0.20 * float(swB),
-                        -0.45, 0.45,
-                    )
-
-                else:
-                    # Include recover-related reasons so we keep trying after sidewalk/lane_depart creep.
-                    # Also include roundabout/curb stop reasons so reverse recovery can trigger when stuck at roundabout.
-                    stop_reasons_never_recover = ("stop_sign", "tl_red", "hold", "hub_wait")
-                    # Default values so they are always defined for downstream logic
-                    blocked_reason = False
-                    not_moving = bool(dr_speed < 0.05)
-                    trying_to_move = bool(speed_cmd > 0.12)
-                    front_blocked = bool(front_valid and (center_front < 0.70 or min_front < 0.45))  # More lenient
-                    no_progress = False
-                    stuck_now = False
-
-                    if stop_reason in stop_reasons_never_recover:
-                        recover_stuck_streak_s = 0.0
-                    else:
-                        blocked_reason = stop_reason in (
-                            "obstacle", "obstacle_slow", "sidewalk_stop", "lane_lost_stop", "lane_depart_stop",
-                            "sidewalk_recover", "lane_depart_recover",
-                            "sidewalk_rb", "sidewalk_caution", "sidewalk_strong", "sidewalk_soft", "lane_lost",
-                            "wrong_side",
-                            "cte_recover", "cte_stuck_recover",
-                        )
-
-                        # Detect "no progress" even if we're commanding forward (common failure mode: wedged but still commanding).
-                        # Intentionally avoid using blocked_reason here to prevent circular logic (stop_reason -> blocked_reason -> no_progress).
-                        # For CTE-only recovery reasons, require FRONT blockage for "no progress" (avoid over-triggering rock on pure CTE + sidewalk hints).
-                        sidewalk_can_count_for_progress = bool(
-                            sidewalk_confirmed
-                            and stop_reason not in ("cte_recover", "cte_stuck_recover")
-                        )
-                        no_progress = bool(
-                            trying_to_move
-                            and not_moving
-                            and (front_blocked or sidewalk_can_count_for_progress)
-                        )
-
-                        # More lenient stuck detection - only if REALLY stuck / not moving.
-                        stuck_now = bool(
-                            not_moving
-                            and (
-                                ((speed_cmd <= 0.05) and blocked_reason)
-                                or no_progress
-                            )
-                        )
-
-                    # Check for wrong-way in roundabout - only when actually INSIDE (rb_in_zone), not at entrance.
-                    # At entrance, path curves sharply and heading error can exceed 1.2 rad without being wrong-way.
-                    in_roundabout = t < rb_active_until
-                    actually_inside_rb = rb_in_zone  # Only true when < RB_EXIT_ZONE_M from center
-                    heading_err_recover = math.atan2(
-                        math.sin(pure_pursuit.th_ref - pose_th), math.cos(pure_pursuit.th_ref - pose_th))
-                    # Use 90° (1.57 rad) so only truly backwards triggers; require stuck or blocked so we don't reverse on heading alone at entrance
-                    wrong_way_in_rb = bool(actually_inside_rb and abs(heading_err_recover) > 1.57)
-                    wrong_way_can_trigger = wrong_way_in_rb and (stuck_now or front_blocked)
-                    # In roundabout: allow recovery when stuck (low cmd + not moving) even if front not blocked (e.g. wedged on curb)
-                    in_rb_stuck = bool(actually_inside_rb and stuck_now)
-                    can_trigger_rb_stuck = bool(actually_inside_rb and (stuck_now or no_progress) and (blocked_reason or front_blocked or bool(sidewalk_confirmed)))
-
-                    # When outside the roundabout and NOT front‑blocked, never treat pure CTE-based stop reasons
-                    # as "stuck" – this prevents repeated rock recoveries such as recover_cte_recover with clear front.
-                    if (
-                        stop_reason in ("cte_recover", "cte_stuck_recover")
-                        and not front_blocked
-                        and not actually_inside_rb
-                        and not wrong_way_can_trigger
-                        and not can_trigger_rb_stuck
-                    ):
-                        no_progress = False
-                        stuck_now = False
-
-                    # Hard cap on how many recovery cycles we will attempt in a single contiguous stuck episode.
-                    # This prevents effectively infinite rock/reverse loops when CTE-based recovery cannot make progress.
-                    MAX_RECOVER_TRIGGERS = 8
-                    
-                    if t < recover_cooldown_until:
-                        recover_stuck_streak_s = 0.0
-                    else:
-                        # Allow recovery even when not in RB and front isn't blocked (e.g., wedged on curb with sidewalk_confirmed/cte_recover).
-                        should_attempt_recover = bool(
-                            (not route_done) and (active_name != "TO_HUB")
-                            and recover_trigger_count < MAX_RECOVER_TRIGGERS
-                            and (
-                                (stuck_now and (front_blocked or actually_inside_rb or blocked_reason or bool(sidewalk_confirmed)))
-                                or wrong_way_can_trigger
-                                or can_trigger_rb_stuck
-                            )
-                        )
-
-                    if t < recover_cooldown_until:
-                        pass
-                    elif should_attempt_recover:
-                        if wrong_way_can_trigger:
-                            # Wrong-way inside roundabout and stuck/blocked: more aggressive recovery
-                            recover_stuck_streak_s += dt * 1.5
-                        else:
-                            recover_stuck_streak_s += dt
-                        
-                        # Shorter confirm when wrong-way or roundabout-only stuck so we recover sooner
-                        # Also shorten confirm when we detect "no_progress" (wedged/curb contact often oscillates speed and would never reach 0.8s).
-                        no_progress_mult = 0.65 if no_progress else 1.0
-                        confirm_time = RECOVER_STUCK_CONFIRM_S * (0.6 if (wrong_way_can_trigger or can_trigger_rb_stuck) else 1.0) * no_progress_mult
-                        if recover_stuck_streak_s >= confirm_time:
-                            recover_stuck_streak_s = 0.0
-                            recover_trigger_count += 1
-                            # Longer reverse after 2+ recoveries or if wrong-way in roundabout (more rotation to escape)
-                            wrong_way_mult = 1.9 if wrong_way_in_rb else 1.0
-                            rev_s = float(RECOVER_REVERSE_S) * (1.65 if recover_trigger_count >= 2 else 1.0) * wrong_way_mult
-                            fwd_s = float(RECOVER_FORWARD_S) * (1.2 if recover_trigger_count >= 2 else 1.0)
-                            recover_reverse_until = t + rev_s
-                            recover_forward_until = recover_reverse_until + fwd_s
-                            recover_cooldown_until = t + float(RECOVER_COOLDOWN_S)
-                            base_reason = stop_reason or ("no_progress" if no_progress else "stuck")
-                            recover_reason = f"recover_{base_reason}" + ("_wrongway_rb" if wrong_way_in_rb else "")
-                            # So th_ref points correct circulation: resync pure_pursuit to a waypoint AHEAD on path
-                            if wrong_way_in_rb and pure_pursuit is not None and active_wp.size > 0:
-                                n_wp = active_wp.shape[0]
-                                ahead = min(i_near + 14, n_wp - 1)
-                                if ahead > i_near:
-                                    set_waypoint_index_safe(ahead)
-                                # Keep "force right" after recovery so we don't immediately drift wrong again
-                                wrong_way_force_right_until = max(wrong_way_force_right_until, t + rev_s + fwd_s + 3.0)
-
-                            # Suppress verbose per-attempt recover prints to avoid
-                            # flooding the console near the end of a scenario.
-                            pass
-                    else:
-                        # Don't hard-reset: decay so brief speed spikes don't prevent recovery from ever triggering.
-                        recover_stuck_streak_s = max(0.0, float(recover_stuck_streak_s) - float(dt) * 0.6)
-                    # Reset recovery count once we've been moving again for a while
-                    if t > recover_cooldown_until + 4.0 and dr_speed > 0.08:
-                        recover_trigger_count = 0
+            # Recovery mode is DISABLED - skip all recovery logic
+            # Keep the stuck detection variables at default values
+            stop_reasons_never_recover = ("stop_sign", "tl_red", "hold", "hub_wait")
+            # Recovery mode is DISABLED - keep variables at defaults
+            blocked_reason = False
+            not_moving = False
+            trying_to_move = False
+            front_blocked = False
+            no_progress = False
+            stuck_now = False
+            in_recovery = False
 
             # Enforce minimum cruise speed when moving forward (unless hard stop / cautious creep)
             _no_min_speed = (
@@ -2909,92 +2688,19 @@ def run_scenario(
             if speed_cmd > 1e-3 and stop_reason not in _no_min_speed and not (stop_reason or "").startswith("recover_"):
                 speed_cmd = max(speed_cmd, MIN_CRUISE_SPEED)
 
-            # ----------------------------------------------------------
-            # WRONG SIDE OF ROAD – if lane says we're left of lane center, force steer right
-            # (e.g. after roundabout or curve we must not stay in oncoming lane)
-            # ----------------------------------------------------------
-            # Wrong side: car left of lane center (lane_err < 0); steer right to rejoin
-            # Skip on TO_DROPOFF and TO_HUB: these paths run on the left half of the road
-            # by design; a negative lane_err here is normal, not wrong-way.
-            if (not in_recovery and lane_ok and lane_conf >= 0.35
-                    and float(lane_err) < -WRONG_SIDE_LANE_ERR
-                    and active_name not in ("TO_DROPOFF", "TO_HUB")):
-                wrong_way_force_right_until = max(wrong_way_force_right_until, t + WRONG_SIDE_FORCE_RIGHT_S)
-                steer_raw = min(steer_raw, float(WRONG_SIDE_STEER_RIGHT))
-                # Use correction speed so we rejoin (don't override full stop for obstacles)
-                if speed_cmd > 0.08:
-                    speed_cmd = max(min(speed_cmd, float(WRONG_SIDE_SPEED)), 0.42)
-                if not stop_reason:
-                    stop_reason = "wrong_side"
-
-            # ----------------------------------------------------------
-            # EXTREME SIDEWALK GUARD (unbreakable) – runs last, nothing can override
-            # EXCEPT during wrong-way correction: never steer LEFT (would worsen wrong-way at roundabout).
-            # ----------------------------------------------------------
-            wrong_way_correcting = bool(t < wrong_way_force_right_until)
-            if not in_recovery and (swC > SW_EXTREME_THRESHOLD or swN > SW_EXTREME_THRESHOLD):
-                speed_cmd = min(speed_cmd, MIN_CRUISE_SPEED)
-                if wrong_way_correcting:
-                    if swB < -0.02:
-                        steer_raw = -0.42   # Sidewalk on left → steer right (ok in wrong-way mode)
-                    # else: keep current steer_raw (keep-right), do NOT steer left
-                else:
-                    if swB > 0.02:
-                        steer_raw = 0.42   # Sidewalk on right → steer left
-                    elif swB < -0.02:
-                        # Sidewalk on left → steer right, UNLESS pure pursuit strongly says left
-                        if swB > -0.50 and target_steer > 0.15:
-                            steer_raw = clamp(target_steer, -0.45, 0.45)
-                        else:
-                            steer_raw = -0.42  # Sidewalk on left → steer right
-                    else:
-                        # swB≈0: can't determine side from bias (e.g. xR off-screen); trust pure pursuit
-                        steer_raw = clamp(target_steer, -0.45, 0.45)
-
-            # ----------------------------------------------------------
-            # LANE LOST OVERRIDE: when no lane lines visible, trust pure pursuit.
-            # Prevents swB-based sidewalk logic from overriding a correct pure-pursuit
-            # direction. If PP says LEFT (target_steer > 0.15) and swB is falsely
-            # negative (xR off-screen against right wall), also push steer toward LEFT.
-            # ----------------------------------------------------------
-            if not lane_ok and not in_roundabout_zone_steer and not in_recovery and not wrong_way_correcting:
-                if target_steer > 0.15:
-                    steer_raw = max(steer_raw, target_steer)  # PP says left – ensure we go left
-                else:
-                    steer_raw = clamp(target_steer, -0.45, 0.45)  # PP says right – trust it
+            # DISABLED: Wrong-side and extreme sidewalk guards - interfering with Pure Pursuit
+            # Let Pure Pursuit handle all steering without interference
 
             # ----------------------------------------------------------
             # 11. Actuate
             # ----------------------------------------------------------
             # #endregion agent log
             throttle  = speed_to_throttle(speed_cmd)
-            # Low-pass on steering to damp oscillation (control + vision)
-            steer_smoothed = 0.80 * last_steer_smooth + 0.20 * steer_raw
+
+            # MINIMAL smoothing for tight tracking - allow quick corrections
+            steer_smoothed = 0.50 * last_steer_smooth + 0.50 * steer_raw
             steer_smoothed = clamp(steer_smoothed, -0.50, 0.50)
             last_steer_smooth = steer_smoothed
-            # Final sidewalk enforcement (extra safety): if sidewalk is strongly
-            # detected, force steering AWAY from curb and cap speed.
-            try:
-                if not in_recovery and (swC > SW_EXTREME_THRESHOLD or swN > SW_EXTREME_THRESHOLD):
-                    if not lane_ok and target_steer > 0.15 and not in_roundabout_zone_steer and not wrong_way_correcting:
-                        # Lane lost + PP says left: ensure extreme guard doesn't push steer RIGHT
-                        steer_smoothed = max(steer_smoothed, 0.15)
-                    elif swB > 0.02:
-                        steer_smoothed = max(steer_smoothed, 0.20)   # Sidewalk right → ensure left steer
-                    elif swB < -0.02:
-                        # Sidewalk left → ensure right steer, UNLESS pure pursuit strongly says left
-                        if swB > -0.50 and target_steer > 0.15:
-                            steer_smoothed = max(steer_smoothed, 0.15)  # Trust pure pursuit
-                        else:
-                            steer_smoothed = min(steer_smoothed, -0.20)
-                    # Throttle cap: waive when lane is lost (need to move to recover)
-                    # or when pure pursuit says hard LEFT and swB is only mildly negative.
-                    _false_neg_swb = (swB > -0.50 and swB < -0.02 and target_steer > 0.15)
-                    _lane_lost_left = (not lane_ok and target_steer > 0.15 and not in_roundabout_zone_steer and not wrong_way_correcting)
-                    if not _false_neg_swb and not _lane_lost_left:
-                        throttle = min(throttle, SW_PROBE_SPEED)
-            except Exception:
-                pass
 
             steer_out = float(STEER_OUTPUT_SIGN * steer_smoothed)
 
@@ -3011,6 +2717,21 @@ def run_scenario(
             else:
                 led_arr = np.array([0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float64)
                 _led_rgb = (0.0, 1.0, 0.0)
+
+            # Log speed data
+            if 'speed_cmd' in locals() and 'throttle' in locals():
+                try:
+                    speed_writer.writerow([t, speed_cmd, dr_speed, throttle])
+                except Exception:
+                    pass
+
+            # Log steering data (add after steer_raw is computed)
+            if 'target_steer' in locals() and 'steer_raw' in locals() and 'steer_out' in locals():
+                lane_steer_val = lane_steer if 'lane_steer' in locals() else 0.0
+                try:
+                    steer_writer.writerow([t, target_steer, lane_steer_val, steer_raw, steer_out])
+                except Exception:
+                    pass
 
             car.read_write_std(throttle=throttle, steering=steer_out, LEDs=led_arr)
             if _led_ctrl.connected and _led_rgb != _prev_led_rgb:
@@ -3055,14 +2776,16 @@ def run_scenario(
                 route_segments, active_wp, pose_x, pose_y, pose_th,
                 pure_pursuit, i_near, step_name,
             )
-            cv2.imshow("waypoint_map", wp_map)
+            wp_map_small = cv2.resize(wp_map, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+            cv2.imshow("waypoint_map", wp_map_small)
             if lane_dbg is not None:
                 cv2.imshow("lane_fit_debug", lane_dbg)
             if sw_dbg is not None:
                 cv2.imshow("lane_sw_debug", sw_dbg)
 
             lidar_map_img = _lidar_mapper.render()
-            cv2.imshow("lidar_map", lidar_map_img)
+            lidar_map_small = cv2.resize(lidar_map_img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+            cv2.imshow("lidar_map", lidar_map_small)
 
             cv2.waitKey(1)
 
@@ -3098,6 +2821,33 @@ def run_scenario(
             cv2.destroyAllWindows()
         except Exception:
             pass
+
+        # Close log files
+        try:
+            cte_log.close()
+            speed_log.close()
+            steer_log.close()
+            segment_log.close()
+            sign_log.close()
+        except Exception:
+            pass
+        
+        # Print summary to console
+        if debug_print:
+            try:
+                print("\n" + "="*50)
+                print("PAPER DATA LOGGING SUMMARY")
+                print("="*50)
+                print(f"Sign events:")
+                for sign_type, count in sign_event_count.items():
+                    print(f"  {sign_type}: {count}")
+                print(f"Segment times:")
+                for seg, dur in segment_times.items():
+                    print(f"  {seg}: {dur:.1f}s")
+                print(f"Log files saved to: {os.path.abspath(log_dir)}")
+                print("="*50 + "\n")
+            except Exception:
+                pass
 
 # ===================================================================
 #  CLI
